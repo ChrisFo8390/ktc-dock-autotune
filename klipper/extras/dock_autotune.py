@@ -10,6 +10,10 @@
 # toolchanger's own error_gcode (the shuttle leaves the dock along the dock's path); while
 # a scan is running, `printer.dock_autotune.active` is True and that handler does not pause.
 #
+# Before the scan the machine can be brought into the state of a print start (bed temperature,
+# homing, gantry levelling, touch homing with T0 for Cartographer / Beacon contact). The module
+# detects the probe and offers that preparation in a prompt (Mainsail / Fluidd), see DOCK_AUTOTUNE.
+#
 # Optionally the accelerometer of the tool is recorded during every trial (peak and RMS of
 # the shock, written to the log). It only helps to judge a position and to stop a scan when
 # something hits hard (abort_g); it never decides on its own.
@@ -93,6 +97,151 @@ def shock_metrics(samples):
 
 
 # ---------------------------------------------------------------------------
+# Preparation: detection, plan, prompt (pure, used by the tests)
+# ---------------------------------------------------------------------------
+
+BED_MIN_BUTTON = 30.
+EMPTY_SHUTTLE = '(put a tool that is on the shuttle back into its dock)'
+
+
+def detect_setup(settings, commands):
+    """
+    What the machine has, from the parsed config (printer.configfile.settings) and the registered
+    G-code commands. Decides if a preparation like a print start can be done with an empty shuttle.
+    Returns a dict: probe (name or None), touch_cmd, level_cmd, has_bed, has_mesh, max_bed,
+    can_prepare, reason (why not).
+    """
+    settings = {str(k).lower(): v for k, v in (settings or {}).items()}
+
+    def has(name):
+        return name in settings
+
+    def has_prefix(prefix):
+        return any(k == prefix or k.startswith(prefix + ' ') for k in settings)
+
+    endstop = str((settings.get('stepper_z') or {}).get('endstop_pin', '')).strip().lower()
+    probe, touch_cmd, reason = None, None, ''
+    if has('cartographer'):
+        probe = 'Cartographer'
+        if 'CARTOGRAPHER_TOUCH_HOME' in commands:
+            touch_cmd = 'CARTOGRAPHER_TOUCH_HOME'
+    elif has('beacon'):
+        probe = 'Beacon'
+        # with home_method contact every G28 Z touches the bed with the nozzle of the mounted tool
+        if str((settings.get('beacon') or {}).get('home_method', '')).strip().lower() == 'contact':
+            touch_cmd = 'G28 Z'
+    elif has_prefix('probe_eddy_current'):
+        probe = 'Eddy current probe'
+    elif has('scanner'):
+        probe = 'Cartographer (legacy [scanner] module)'
+        reason = ("the legacy [scanner] module is not recognised: its touch homing cannot be told apart "
+                  "from the scan homing")
+    elif has('probe') or has('bltouch'):
+        probe = 'probe' if has('probe') else 'bltouch'
+    if has_prefix('tool_probe') or endstop.startswith('tool_probe'):
+        reason = "the Z probe sits on a tool (tool_probe): Z cannot be homed with an empty shuttle"
+    elif not reason and endstop.startswith('probe:') and probe is None:
+        reason = ("Z homes on a probe but no Cartographer, Beacon, eddy current or probe section was found: "
+                  "Z cannot be homed with an empty shuttle")
+    level = None
+    if has('quad_gantry_level'):
+        level = 'QUAD_GANTRY_LEVEL'
+    elif has('z_tilt'):
+        level = 'Z_TILT_ADJUST'
+    try:
+        max_bed = float((settings.get('heater_bed') or {}).get('max_temp'))
+    except (TypeError, ValueError):
+        max_bed = None
+    return {'probe': probe, 'touch_cmd': touch_cmd, 'level_cmd': level, 'has_bed': has('heater_bed'),
+            'has_mesh': has('bed_mesh'), 'max_bed': max_bed, 'can_prepare': not reason, 'reason': reason}
+
+
+def build_plan(setup, bed, soak, touch_cmd, touch_tool, touch_temp, touch_repeats, before_touch=()):
+    """The preparation as a list of G-code lines (the PRINT_START up to the preparation of the tools)"""
+    plan = ['INITIALIZE_TOOLCHANGER', EMPTY_SHUTTLE]
+    if bed > 0 and setup['has_bed']:
+        plan.append('M190 S%g' % bed)
+        if soak > 0:
+            plan.append('G4 P%d' % int(round(soak * 1000)))
+    plan.append('G28')
+    if setup['level_cmd']:
+        plan.append(setup['level_cmd'])
+    if setup['has_mesh']:
+        plan.append('BED_MESH_CLEAR')
+    if touch_cmd:
+        plan.append("SELECT_TOOL T=%d %s" % (touch_tool, RESTORE_NONE))
+        if touch_temp > 0:
+            plan.append('M104 S%g' % touch_temp)
+        plan.extend(before_touch)
+        if touch_temp > 0:
+            plan.append('M109 S%g' % touch_temp)
+        plan.extend([touch_cmd] * touch_repeats)
+        if touch_temp > 0:
+            plan.append('M104 S0')
+        plan.append("UNSELECT_TOOL %s" % RESTORE_NONE)
+    elif setup['level_cmd']:
+        plan.append('G28 Z')        # levelling moved Z, the reference is taken again like in a print
+    return plan
+
+
+def command_line(params, **override):
+    """DOCK_AUTOTUNE with the parameters of the call, some replaced or removed (value None)"""
+    merged = {str(k).upper(): v for k, v in params.items()}
+    for key, value in override.items():
+        merged[key.upper()] = value
+    parts = ['T=%s' % merged.pop('T')] if 'T' in merged else []
+    parts += ['%s=%s' % (k, v) for k, v in merged.items() if v is not None]
+    return 'DOCK_AUTOTUNE ' + ' '.join(parts)
+
+
+def build_prompt(number, params, setup, plan, bed, touch_cmd):
+    """Lines of a Mainsail / Fluidd action prompt that offers the preparation"""
+    def line(text):
+        return '// action:' + text.replace('\n', ' ')
+
+    out = [line('prompt_begin Dock autotune T%d' % number)]
+    close = line('prompt_footer_button Close|RESPOND TYPE=command MSG=action:prompt_end|info')
+    if not setup['can_prepare']:
+        out.append(line('prompt_text Preparation is not possible: %s.' % setup['reason']))
+        out.append(line('prompt_text Home and prepare the machine by hand like before a print (bed temperature, '
+                        'homing, gantry levelling, Z reference, shuttle empty), then continue.'))
+        out.append(line('prompt_button_group_start'))
+        out.append(line('prompt_button The machine is prepared - continue|%s|warning'
+                        % command_line(params, PREPARE=0, BED=None)))
+        out.append(line('prompt_button_group_end'))
+        out.extend([close, line('prompt_show')])
+        return out
+    out.append(line('prompt_text Probe: %s. %s.' % (
+        setup['probe'] or 'none (Z endstop)',
+        ('Touch homing: %s with T%s' % (touch_cmd, plan_touch_tool(plan))) if touch_cmd else 'No touch homing')))
+    steps = [p for p in plan if p not in ('INITIALIZE_TOOLCHANGER', EMPTY_SHUTTLE)]
+    out.append(line('prompt_text Preparation like the PRINT_START: ' + ', '.join(steps)))
+    out.append(line('prompt_text Bed temperature: %g C (change it with the buttons)' % bed))
+    out.append(line('prompt_button_group_start'))
+    top = setup['max_bed'] or 120.
+    for delta in (-10, -5, 5, 10):
+        new = min(max(bed + delta, BED_MIN_BUTTON), top)
+        if new != bed:
+            out.append(line('prompt_button %+d C|%s|secondary' % (delta, command_line(params, BED='%g' % new))))
+    out.append(line('prompt_button_group_end'))
+    out.append(line('prompt_button Prepare and start (bed %g C)|%s|primary'
+                    % (bed, command_line(params, PREPARE=1, BED='%g' % bed))))
+    out.append(line('prompt_button The machine is already prepared|%s|warning'
+                    % command_line(params, PREPARE=0, BED=None)))
+    out.extend([line('prompt_footer_button Cancel|RESPOND TYPE=command MSG=action:prompt_end|info'),
+                line('prompt_show')])
+    return out
+
+
+def plan_touch_tool(plan):
+    """Number of the tool the plan uses for the touch homing"""
+    for entry in plan:
+        if entry.startswith('SELECT_TOOL T='):
+            return entry.split('T=')[1].split()[0]
+    return '0'
+
+
+# ---------------------------------------------------------------------------
 # Klipper object
 # ---------------------------------------------------------------------------
 
@@ -112,6 +261,14 @@ class DockAutotune:
         self.accel = config.getfloat('accel', 2000., above=0.)
         self.settle = config.getfloat('settle', 0.3, minval=0.)
         self.max_cycles = config.getint('max_cycles', 400, minval=1)
+        # Preparation like a print start (offered in a prompt)
+        self.bed_temp = config.getfloat('bed_temp', 70., minval=0.)
+        self.bed_soak = config.getfloat('bed_soak', 0., minval=0.)
+        self.touch_command = config.get('touch_command', 'auto').strip()
+        self.touch_tool = config.getint('touch_tool', 0, minval=0)
+        self.touch_temp = config.getfloat('touch_temp', 150., minval=0.)
+        self.touch_repeats = config.getint('touch_repeats', 2, minval=1)
+        self.before_touch = [l.strip() for l in config.get('before_touch', '').splitlines() if l.strip()]
         # Accelerometer of the tool: "adxl345 T{tool}" (the section must be named per tool)
         self.accel_chip = config.get('accelerometer', 'adxl345 T{tool}')
         self.abort_g = config.getfloat('abort_g', 0., minval=0.)
@@ -183,6 +340,62 @@ class DockAutotune:
         except Exception:
             logging.exception("dock_autotune: accelerometer read failed")
             return None
+
+    # -- preparation like a print start ------------------------------------------
+
+    def _detect(self):
+        configfile = self.printer.lookup_object('configfile', None)
+        settings = {}
+        if configfile is not None:
+            try:
+                settings = configfile.get_status(self._now()).get('settings', {})
+            except Exception:
+                logging.exception("dock_autotune: cannot read the parsed config")
+        return detect_setup(settings, set(getattr(self.gcode, 'ready_gcode_handlers', {})))
+
+    def _make_plan(self, gcmd, setup, bed, soak):
+        """Plan of the preparation. Touch homing as detected (TOUCH=0 turns it off, touch_command overrides)"""
+        touch = setup['touch_cmd']
+        if self.touch_command.lower() == 'none':
+            touch = None
+        elif self.touch_command.lower() != 'auto':
+            touch = self.touch_command
+        if gcmd.get_int('TOUCH', 1) == 0:
+            touch = None
+        if touch and self.printer.lookup_object('tool T%d' % self.touch_tool, None) is None:
+            raise gcmd.error("DOCK_AUTOTUNE: touch homing needs tool T%d (touch_tool)" % self.touch_tool)
+        return touch, build_plan(setup, bed, soak, touch, self.touch_tool, self.touch_temp,
+                                 self.touch_repeats, self.before_touch)
+
+    def _prepare(self, gcmd, plan):
+        """Run the plan. A tool on the shuttle is put back first, which needs Z homed or a G28."""
+        self.state['phase'] = 'prepare'
+        gcmd.respond_info("dock_autotune: preparing like a print start:\n  " + '\n  '.join(
+            p for p in plan if p != EMPTY_SHUTTLE))
+        for entry in plan:
+            self._check_abort()
+            if entry == EMPTY_SHUTTLE:
+                status = self._tc_status()
+                if status['status'] != 'ready':
+                    raise AbortScan('the toolchanger is %s after INITIALIZE_TOOLCHANGER - check the shuttle'
+                                    % status['status'])
+                if status['tool_number'] != -1:
+                    toolhead = self.printer.lookup_object('toolhead')
+                    if not all(a in toolhead.get_status(self._now())['homed_axes'] for a in 'xyz'):
+                        self._run('G28')
+                    self._run("UNSELECT_TOOL %s" % RESTORE_NONE)
+                    self._wait()
+                continue
+            self.state['message'] = entry
+            self._run(entry)
+        self._wait()
+        gcmd.respond_info("dock_autotune: preparation done")
+
+    def _prompt(self, gcmd, number, setup, plan, bed, touch):
+        for text in build_prompt(number, gcmd.get_command_parameters(), setup, plan, bed, touch):
+            self.gcode.respond_raw(text)
+        gcmd.respond_info("dock_autotune: choose in the prompt, or call DOCK_AUTOTUNE again with PREPARE=1 "
+                          "(prepare) or PREPARE=0 (the machine is prepared)")
 
     # -- one pickup + dropoff ---------------------------------------------------
 
@@ -305,7 +518,7 @@ class DockAutotune:
 
     cmd_DOCK_AUTOTUNE_help = ("Find the window in which a tool locks and centre its dock position: "
                               "DOCK_AUTOTUNE T=<n> [AXES=xyz] [STEP=0.1] [RANGE=<mm>] [REPEATS=2] "
-                              "[SPEED=0.5] [ADXL=1] [DRY_RUN=1]")
+                              "[SPEED=0.5] [ADXL=1] [PREPARE=0|1] [BED=70] [SOAK=<s>] [TOUCH=0] [DRY_RUN=1]")
 
     def cmd_DOCK_AUTOTUNE(self, gcmd):
         if self.active:
@@ -330,7 +543,36 @@ class DockAutotune:
         tool = self.printer.lookup_object('tool T%d' % number, None)
         if tool is None:
             raise gcmd.error("DOCK_AUTOTUNE: no tool T%d" % number)
-        self._preconditions(gcmd, number)
+        self._check_not_printing(gcmd)
+
+        # PREPARE=1: bring the machine into the state of a print start first, PREPARE=0: it is
+        # prepared already, without PREPARE the prompt asks (not for DRY_RUN)
+        prepare = gcmd.get_int('PREPARE', None)
+        bed = gcmd.get_float('BED', self.bed_temp, minval=0.)
+        soak = gcmd.get_float('SOAK', self.bed_soak, minval=0.)
+        plan = []
+        if prepare != 0:
+            setup = self._detect()
+            if setup['max_bed'] and bed > setup['max_bed']:
+                raise gcmd.error("DOCK_AUTOTUNE: BED=%g is above max_temp %g of the heater_bed"
+                                 % (bed, setup['max_bed']))
+            touch, plan = self._make_plan(gcmd, setup, bed, soak)
+            if prepare is None and not dry_run:
+                self._prompt(gcmd, number, setup, plan, bed, touch)
+                return
+            if prepare == 1 and not setup['can_prepare']:
+                raise gcmd.error("DOCK_AUTOTUNE: preparation is not possible: %s. Prepare the machine by hand "
+                                 "and use PREPARE=0" % setup['reason'])
+            if not setup['can_prepare']:        # DRY_RUN only
+                gcmd.respond_info("dock_autotune: preparation is not possible: %s" % setup['reason'])
+                plan = []
+            else:
+                gcmd.respond_info("dock_autotune: probe %s, touch homing %s, levelling %s"
+                                  % (setup['probe'] or 'none (Z endstop)', touch or 'none',
+                                     setup['level_cmd'] or 'none'))
+        prepare = prepare == 1
+        if not prepare and not (dry_run and plan):
+            self._check_state(gcmd, number)
 
         per_axis = {a: int(limits[a] / step + 1e-9) for a in axes}
         trials = sum(2 * n + (2 if self.refine else 0) + 2 for n in per_axis.values())
@@ -340,6 +582,9 @@ class DockAutotune:
                              repeats, trials, trials * repeats,
                              *[float(tool.params['params_park_%s' % a]) for a in 'xyz']))
         if dry_run:
+            if plan:
+                gcmd.respond_info("DRY_RUN: PREPARE=1 would run first:\n  " + '\n  '.join(
+                    p for p in plan if p != EMPTY_SHUTTLE))
             gcmd.respond_info("DRY_RUN: nothing moved")
             return
         self.repeats, saved_repeats = repeats, self.repeats
@@ -350,6 +595,10 @@ class DockAutotune:
         originals = {a: float(tool.params['params_park_%s' % a]) for a in AXES}
         proposals, base = {}, {}
         try:
+            if prepare:
+                self._prepare(gcmd, plan)
+                self._check_state(gcmd, number)
+            self.state['phase'] = 'start'
             self._run("SET_VELOCITY_LIMIT ACCEL=%g" % min(self.accel, saved_accel))
             tool.set_parameter('params_path_speed', saved_speed * speed)
             if self._tc_status()['tool_number'] == number:
@@ -380,14 +629,16 @@ class DockAutotune:
             self.active = False
             self.state['phase'] = 'idle'
 
-    def _preconditions(self, gcmd, number):
-        toolhead = self.printer.lookup_object('toolhead')
-        if not all(a in toolhead.get_status(self._now())['homed_axes'] for a in 'xyz'):
-            raise gcmd.error("DOCK_AUTOTUNE: home all axes first (same way as before a print: G28, QUAD_GANTRY_LEVEL, "
-                             "touch home with T0)")
+    def _check_not_printing(self, gcmd):
         stats = self.printer.lookup_object('print_stats', None)
         if stats is not None and stats.get_status(self._now()).get('state') in ('printing', 'paused'):
             raise gcmd.error("DOCK_AUTOTUNE: not while a print is running or paused")
+
+    def _check_state(self, gcmd, number):
+        toolhead = self.printer.lookup_object('toolhead')
+        if not all(a in toolhead.get_status(self._now())['homed_axes'] for a in 'xyz'):
+            raise gcmd.error("DOCK_AUTOTUNE: home all axes first (same way as before a print), or let "
+                             "DOCK_AUTOTUNE prepare the machine (PREPARE=1)")
         status = self._tc_status()
         if status['status'] != 'ready':
             raise gcmd.error("DOCK_AUTOTUNE: toolchanger is %s (INITIALIZE_TOOLCHANGER first)" % status['status'])

@@ -34,7 +34,9 @@ alongside and can stop the scan (`abort_g`), but it never decides.
   shuttle out of the dock the scan stops as well (it checks that the shuttle is back at `params_safe_y`).
   [`examples/toolchanger-error-handler.cfg`](examples/toolchanger-error-handler.cfg) is a handler that does
   this (it needs the Mainsail/Fluidd client macros `PAUSE` and `_CLIENT_VARIABLE`).
-* Not usable while a print is running or paused. All axes homed.
+* Not usable while a print is running or paused. All axes homed, or let the preparation do it (see "Use").
+* The prompt needs a frontend that understands `// action:prompt_*` (Mainsail, Fluidd, KlipperScreen).
+  Without one, call `DOCK_AUTOTUNE` with `PREPARE=1` or `PREPARE=0` and no prompt is needed.
 
 ## Install
 
@@ -63,25 +65,40 @@ to the config directory by hand.
 
 ## Use
 
-Prepare the machine like before a print, in the same thermal state, so the Z reference is the one the
-docks see in production (with a touch homing the Z zero depends on the bed):
+The docks have to be tuned in the state they are used in: same bed temperature, gantry levelled, and
+(with a touch homing) the Z zero taken by the touch tool, because that zero depends on the bed and on the tool.
+`DOCK_AUTOTUNE` therefore starts with a **preparation** that does what your `PRINT_START` does before the tools
+are prepared. It works from any state of the machine: homed or not, cold or hot, a tool on the shuttle or not.
 
 ```
-G28
-QUAD_GANTRY_LEVEL
-T0                              # or whatever you use for the touch homing
-CARTOGRAPHER_TOUCH_HOME         # the touch homing of your PRINT_START
-UNSELECT_TOOL                   # shuttle empty, every tool in its dock
-```
-
-Then, for the tool whose dock you want to tune:
-
-```
-DOCK_AUTOTUNE T=1 DRY_RUN=1                 # only prints the plan
+DOCK_AUTOTUNE T=1 DRY_RUN=1                 # only prints the detection and the plan
 DOCK_AUTOTUNE T=1 AXES=z RANGE=0.4          # first run: one axis, small range, watch it
 DOCK_AUTOTUNE T=1                           # x, y, z with the configured ranges
 DOCK_AUTOTUNE_INTERRUPT                     # stops after the current trial (M112 stops at once)
 ```
+
+Without `PREPARE` the command shows a prompt and does nothing else:
+
+* It names the detected probe (Cartographer, Beacon, eddy current, plain probe, or none: Z endstop) and
+  whether a touch homing is used (`CARTOGRAPHER_TOUCH_HOME`; Beacon with `home_method: contact`, where
+  `G28 Z` touches), and lists the steps.
+* **Prepare and start** runs them with the bed temperature shown (default `bed_temp: 70`, changed with the
+  -10 / -5 / +5 / +10 buttons or `BED=`), then the scan starts.
+* **The machine is already prepared** skips the preparation (like `PREPARE=0`).
+* Preparation steps: `INITIALIZE_TOOLCHANGER`; a tool on the shuttle is put back into its dock (with a `G28`
+  first if nothing is homed); `M190` to the bed temperature (`SOAK=<s>` waits longer); `G28`; `QUAD_GANTRY_LEVEL`
+  (or `Z_TILT_ADJUST`); `BED_MESH_CLEAR`; the touch homing with `touch_tool` (default T0, **only that tool**,
+  it is picked up with `SELECT_TOOL`, not with `T0`, so AFC is not asked to load anything): nozzle to
+  `touch_temp`, `before_touch` (for example `BRUSH`), `touch_repeats` times the touch command, nozzle off,
+  tool back into its dock. Without a touch homing the Z zero is taken again with `G28 Z` after the levelling.
+  A failure in any step stops everything with a report.
+* If Z cannot be homed with an empty shuttle (the probe sits on a tool: `tool_probe`; or `probe:` is the Z
+  endstop but no probe section exists; or the legacy `[scanner]` module) the prompt says so and offers only
+  "The machine is prepared - continue" or "Close". `PREPARE=1` is refused with the same message. Prepare the
+  machine by hand and use `PREPARE=0`.
+
+`PREPARE=0` expects the state of a print start: homed, levelled, Z reference from the same homing as in
+production, bed hot, shuttle empty or the tool of the scan on it. `TOUCH=0` leaves out the touch homing.
 
 At the end the new values are applied until the next restart and printed as `params_park_x: ...`
 lines. Copy them into `toolchanger/tools/T<n>.cfg`. (`SAVE_TOOL_PARAMETER` plus `SAVE_CONFIG` works too,
@@ -98,7 +115,14 @@ it is how the edge of the window is found.
 | `REPEATS=2` | pickups per candidate |
 | `SPEED=0.5` | factor on `params_path_speed` while scanning |
 | `ADXL=1` | record the accelerometer of the tool (`[adxl345 T<n>]`) |
+| `PREPARE=1` / `PREPARE=0` | prepare like a print start, then scan / the machine is prepared; no prompt |
+| `BED=<°C>`, `SOAK=<s>` | bed temperature of the preparation (default `bed_temp`), extra wait |
+| `TOUCH=0` | no touch homing in the preparation |
 | `DRY_RUN=1` | print the plan, move nothing |
+
+Does the dock position depend on the bed temperature? Scan the same dock twice, for example `BED=60` and
+`BED=100`, and compare the `params_park_z` lines. If they differ by more than a fraction of the window, tune at the
+temperature you print at most and keep in mind that the other prints sit closer to the edge.
 
 A scan takes at most `2 * range / step + 4` trials per axis (`DRY_RUN=1` prints the number), each
 `repeats` pickups. Estimate, not measured on a printer: 15 to 25 s per pickup at half speed, so

@@ -7,7 +7,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, 'klipper', 'extras'))
 
 import dock_autotune  # noqa: E402
-from dock_autotune import scan_axis, shock_metrics, window_center  # noqa: E402
+from dock_autotune import (build_plan, build_prompt, command_line, detect_setup, scan_axis,  # noqa: E402
+                           shock_metrics, window_center)
 
 
 # --- pure helpers ----------------------------------------------------------
@@ -83,6 +84,127 @@ class ShockMetricsTests(unittest.TestCase):
         self.assertGreater(m['peak_dev_g'], 0.4)
 
 
+# --- detection, plan, prompt (pure) ------------------------------------------------
+
+CARTO = {'stepper_z': {'endstop_pin': 'probe:z_virtual_endstop'}, 'cartographer': {}, 'quad_gantry_level': {},
+         'bed_mesh': {}, 'heater_bed': {'max_temp': '130'}}
+TOUCH = {'CARTOGRAPHER_TOUCH_HOME', 'G28'}
+
+
+def plan_of(setup, bed=70., soak=0., touch='CARTOGRAPHER_TOUCH_HOME', temp=150., repeats=2, before=()):
+    return build_plan(setup, bed, soak, touch, 0, temp, repeats, before)
+
+
+class DetectSetupTests(unittest.TestCase):
+    def test_cartographer_with_touch(self):
+        setup = detect_setup(CARTO, TOUCH)
+        self.assertEqual((setup['probe'], setup['touch_cmd'], setup['level_cmd']),
+                         ('Cartographer', 'CARTOGRAPHER_TOUCH_HOME', 'QUAD_GANTRY_LEVEL'))
+        self.assertTrue(setup['can_prepare'])
+        self.assertEqual(setup['max_bed'], 130.0)
+
+    def test_cartographer_without_the_touch_command(self):
+        self.assertIsNone(detect_setup(CARTO, {'G28'})['touch_cmd'])
+
+    def test_beacon_touches_only_with_home_method_contact(self):
+        base = {'stepper_z': {'endstop_pin': 'probe:z_virtual_endstop'}}
+        self.assertEqual(detect_setup(dict(base, beacon={'home_method': 'contact'}), set())['touch_cmd'], 'G28 Z')
+        self.assertIsNone(detect_setup(dict(base, beacon={'home_method': 'proximity'}), set())['touch_cmd'])
+        self.assertIsNone(detect_setup(dict(base, beacon={}), set())['touch_cmd'])
+
+    def test_eddy_current_has_no_touch(self):
+        setup = detect_setup({'stepper_z': {'endstop_pin': 'probe:z_virtual_endstop'},
+                              'probe_eddy_current btt': {}, 'z_tilt': {}}, TOUCH)
+        self.assertEqual((setup['probe'], setup['touch_cmd'], setup['level_cmd']),
+                         ('Eddy current probe', None, 'Z_TILT_ADJUST'))
+        self.assertTrue(setup['can_prepare'])
+
+    def test_physical_endstop_homes_without_a_probe(self):
+        setup = detect_setup({'stepper_z': {'endstop_pin': 'PG10'}}, set())
+        self.assertTrue(setup['can_prepare'])
+        self.assertIsNone(setup['probe'])
+        self.assertFalse(setup['has_bed'])
+
+    def test_probe_endstop_without_a_probe_cannot_home_without_a_tool(self):
+        setup = detect_setup({'stepper_z': {'endstop_pin': 'probe:z_virtual_endstop'}}, set())
+        self.assertFalse(setup['can_prepare'])
+        self.assertIn('Z cannot be homed with an empty shuttle', setup['reason'])
+
+    def test_probe_on_a_tool_cannot_home_without_a_tool(self):
+        setup = detect_setup({'stepper_z': {'endstop_pin': 'tool_probe_endstop:z'}, 'tool_probe t0': {}}, set())
+        self.assertFalse(setup['can_prepare'])
+        self.assertIn('tool_probe', setup['reason'])
+
+    def test_legacy_scanner_is_not_guessed(self):
+        setup = detect_setup({'stepper_z': {'endstop_pin': 'probe:z_virtual_endstop'}, 'scanner': {}}, set())
+        self.assertFalse(setup['can_prepare'])
+        self.assertIn('scanner', setup['reason'])
+
+    def test_section_names_are_case_insensitive(self):
+        self.assertEqual(detect_setup({'stepper_z': {'endstop_pin': 'probe:x'}, 'Cartographer': {}}, set())['probe'],
+                         'Cartographer')
+
+
+class PlanTests(unittest.TestCase):
+    def test_plan_follows_the_print_start(self):
+        setup = detect_setup(CARTO, TOUCH)
+        plan = plan_of(setup, before=('BRUSH',))
+        self.assertEqual(plan, [
+            'INITIALIZE_TOOLCHANGER', dock_autotune.EMPTY_SHUTTLE, 'M190 S70', 'G28', 'QUAD_GANTRY_LEVEL',
+            'BED_MESH_CLEAR', "SELECT_TOOL T=0 RESTORE_AXIS=''", 'M104 S150', 'BRUSH', 'M109 S150',
+            'CARTOGRAPHER_TOUCH_HOME', 'CARTOGRAPHER_TOUCH_HOME', 'M104 S0', "UNSELECT_TOOL RESTORE_AXIS=''"])
+
+    def test_without_touch_the_z_reference_is_taken_again_after_levelling(self):
+        plan = plan_of(detect_setup(CARTO, set()), touch=None)
+        self.assertEqual(plan[-3:], ['QUAD_GANTRY_LEVEL', 'BED_MESH_CLEAR', 'G28 Z'])
+        self.assertFalse(any('SELECT_TOOL' in p for p in plan))
+
+    def test_soak_and_no_bed(self):
+        setup = detect_setup(CARTO, TOUCH)
+        self.assertIn('G4 P120000', plan_of(setup, soak=120))
+        self.assertFalse(any(p.startswith('M190') for p in plan_of(setup, bed=0)))
+
+    def test_machine_without_levelling_and_mesh(self):
+        plan = plan_of(detect_setup({'stepper_z': {'endstop_pin': 'PG10'}}, set()), touch=None)
+        self.assertEqual(plan, ['INITIALIZE_TOOLCHANGER', dock_autotune.EMPTY_SHUTTLE, 'G28'])
+
+
+class PromptTests(unittest.TestCase):
+    def test_command_line(self):
+        params = {'T': '1', 'AXES': 'z', 'BED': '60', 'PREPARE': '0'}
+        self.assertEqual(command_line(params, PREPARE=1, BED='75'), 'DOCK_AUTOTUNE T=1 AXES=z BED=75 PREPARE=1')
+        self.assertEqual(command_line(params, PREPARE=None, BED=None), 'DOCK_AUTOTUNE T=1 AXES=z')
+
+    def test_prompt_offers_preparation_and_keeps_the_parameters(self):
+        setup = detect_setup(CARTO, TOUCH)
+        text = '\n'.join(build_prompt(1, {'T': '1', 'AXES': 'z'}, setup, plan_of(setup), 70.,
+                                      'CARTOGRAPHER_TOUCH_HOME'))
+        self.assertTrue(text.startswith('// action:prompt_begin Dock autotune T1'))
+        self.assertTrue(text.rstrip().endswith('// action:prompt_show'))
+        self.assertIn('Cartographer', text)
+        self.assertIn('Prepare and start (bed 70 C)|DOCK_AUTOTUNE T=1 AXES=z PREPARE=1 BED=70|primary', text)
+        self.assertIn('+5 C|DOCK_AUTOTUNE T=1 AXES=z BED=75|', text)
+        self.assertIn('-10 C|DOCK_AUTOTUNE T=1 AXES=z BED=60|', text)
+        self.assertIn('already prepared|DOCK_AUTOTUNE T=1 AXES=z PREPARE=0|', text)
+        self.assertIn('action:prompt_end', text)
+
+    def test_bed_buttons_stay_in_range(self):
+        setup = detect_setup(CARTO, TOUCH)
+        text = '\n'.join(build_prompt(1, {'T': '1'}, setup, plan_of(setup), 125., None))
+        self.assertIn('BED=130|', text)
+        self.assertNotIn('BED=135', text)
+        low = '\n'.join(build_prompt(1, {'T': '1'}, setup, plan_of(setup), 35., None))
+        self.assertIn('-10 C|DOCK_AUTOTUNE T=1 BED=30|', low)
+
+    def test_prompt_without_preparation_possible_only_continues_or_closes(self):
+        setup = detect_setup({'stepper_z': {'endstop_pin': 'tool_probe_endstop:z'}}, set())
+        text = '\n'.join(build_prompt(3, {'T': '3', 'BED': '80'}, setup, [], 70., None))
+        self.assertIn('Preparation is not possible', text)
+        self.assertIn('continue|DOCK_AUTOTUNE T=3 PREPARE=0|', text)
+        self.assertNotIn('PREPARE=1', text)
+        self.assertNotIn('M190', text)
+
+
 # --- the command with a fake printer ----------------------------------------------
 
 class CommandError(Exception):
@@ -127,7 +249,8 @@ class FakeGcode:
     error = CommandError
 
     def __init__(self, dock):
-        self.dock, self.info, self.commands = dock, [], {}
+        self.dock, self.info, self.commands, self.raw = dock, [], {}, []
+        self.ready_gcode_handlers = {}
 
     def register_command(self, name, func, when_not_ready=False, desc=None):
         self.commands[name] = func
@@ -135,11 +258,16 @@ class FakeGcode:
     def respond_info(self, msg, log=True):
         self.info.append(msg)
 
+    def respond_raw(self, msg):
+        self.raw.append(msg)
+
     def run_script_from_command(self, script):
         d = self.dock
         d.scripts.append(script)
         word = script.split()[0]
-        if word == 'SELECT_TOOL':
+        if word == 'SELECT_TOOL' and int(script.split('T=')[1].split()[0]) != d.tool.tool_number:
+            d.mounted = d.detected = int(script.split('T=')[1].split()[0])     # another tool: not part of the model
+        elif word == 'SELECT_TOOL':
             assert "RESTORE_AXIS=''" in script
             d.pickups += 1
             if d.locks():
@@ -157,6 +285,8 @@ class FakeGcode:
             d.status = 'ready'
         elif word == 'SET_VELOCITY_LIMIT':
             d.accel = float(script.split('ACCEL=')[1])
+        elif word == 'G28':
+            d.homed = True
 
 
 class FakeToolchanger:
@@ -174,6 +304,8 @@ class FakeToolhead:
         self.waits = 0
 
     def get_status(self, eventtime):
+        if getattr(self.dock, 'homed', False):
+            self.homed = 'xyz'
         return {'homed_axes': self.homed, 'position': (0.0, self.dock.y, 0.0, 0.0),
                 'max_accel': self.dock.accel}
 
@@ -187,6 +319,14 @@ class FakeToolhead:
 class FakeReactor:
     def monotonic(self):
         return 0.0
+
+
+class FakeConfigfile:
+    def __init__(self, settings):
+        self.settings = settings
+
+    def get_status(self, eventtime):
+        return {'settings': self.settings}
 
 
 class FakePrintStats:
@@ -268,6 +408,9 @@ class FakeGcmd:
     def get_float(self, name, default=None, above=None, maxval=None, minval=None):
         return float(self.params[name]) if name in self.params else default
 
+    def get_command_parameters(self):
+        return dict(self.params)
+
     def respond_info(self, msg):
         self.responses.append(msg)
 
@@ -294,6 +437,7 @@ class CommandTests(unittest.TestCase):
         return self.module
 
     def scan(self, **params):
+        params.setdefault('PREPARE', 0)         # the prompt is tested separately
         gcmd = FakeGcmd(**params)
         self.module.cmd_DOCK_AUTOTUNE(gcmd)
         return gcmd
@@ -466,6 +610,151 @@ class CommandTests(unittest.TestCase):
         gcmd = self.scan(T=2, AXES='x', RANGE=0.8)
         self.assertIn('does not know the scan mode', gcmd.text)
         self.assertEqual(self.tool.params['params_park_x'], 149.6)
+
+    # -- preparation like a print start ---------------------------------------------------
+
+    def carto(self, settings=None, commands=TOUCH):
+        self.printer.objects['configfile'] = FakeConfigfile(CARTO if settings is None else settings)
+        self.printer.objects['gcode'].ready_gcode_handlers = {c: None for c in commands}
+        self.printer.objects['tool T0'] = FakeTool(0, 10.0, -29.0, 266.0)
+
+    def test_without_prepare_the_prompt_is_shown_and_nothing_moves(self):
+        self.make()
+        self.carto()
+        self.module.cmd_DOCK_AUTOTUNE(FakeGcmd(T=2, AXES='z'))
+        raw = self.printer.objects['gcode'].raw
+        self.assertEqual(raw[0], '// action:prompt_begin Dock autotune T2')
+        self.assertEqual(raw[-1], '// action:prompt_show')
+        self.assertTrue(any('PREPARE=1 BED=70' in r for r in raw))
+        self.assertTrue(any('AXES=z' in r for r in raw))
+        self.assertEqual(self.dock.scripts, [])
+        self.assertFalse(self.module.active)
+
+    def test_prepare_runs_like_the_print_start_and_then_scans(self):
+        self.make()
+        self.carto()
+        self.printer.objects['toolhead'].homed = ''
+        self.dock.homed = False
+        gcmd = self.scan(T=2, AXES='z', RANGE=0.8, PREPARE=1, BED=75)
+        self.assertNotIn('STOPPED', gcmd.text)
+        self.assertEqual(self.dock.scripts[:13], [
+            'INITIALIZE_TOOLCHANGER', 'M190 S75', 'G28', 'QUAD_GANTRY_LEVEL', 'BED_MESH_CLEAR',
+            "SELECT_TOOL T=0 RESTORE_AXIS=''", 'M104 S150', 'M109 S150', 'CARTOGRAPHER_TOUCH_HOME',
+            'CARTOGRAPHER_TOUCH_HOME', 'M104 S0', "UNSELECT_TOOL RESTORE_AXIS=''",
+            'SET_VELOCITY_LIMIT ACCEL=2000'])
+        self.assertTrue(self.dock.scripts[13].startswith('SELECT_TOOL T=2'))
+        self.assertAlmostEqual(self.tool.params['params_park_z'], self.centre('z'), places=3)
+        self.assertEqual((self.dock.mounted, self.dock.status), (-1, 'ready'))
+
+    def test_prepare_puts_a_tool_on_the_shuttle_back_first(self):
+        self.make()
+        self.carto()
+        self.dock.mounted = 1
+        self.scan(T=2, AXES='z', RANGE=0.3, PREPARE=1)
+        self.assertEqual(self.dock.scripts[:3], ['INITIALIZE_TOOLCHANGER', "UNSELECT_TOOL RESTORE_AXIS=''", 'M190 S70'])
+
+    def test_prepare_homes_before_it_puts_the_tool_back_when_nothing_is_homed(self):
+        self.make()
+        self.carto()
+        self.dock.mounted = 1
+        self.printer.objects['toolhead'].homed = ''
+        self.dock.homed = False
+        self.scan(T=2, AXES='z', RANGE=0.3, PREPARE=1)
+        self.assertEqual(self.dock.scripts[:4], ['INITIALIZE_TOOLCHANGER', 'G28', "UNSELECT_TOOL RESTORE_AXIS=''",
+                                                 'M190 S70'])
+
+    def test_touch_can_be_turned_off(self):
+        self.make()
+        self.carto()
+        self.scan(T=2, AXES='z', RANGE=0.3, PREPARE=1, TOUCH=0)
+        self.assertNotIn('CARTOGRAPHER_TOUCH_HOME', self.dock.scripts)
+        self.assertIn('G28 Z', self.dock.scripts)
+
+    def test_touch_settings_from_the_config(self):
+        self.make(touch_temp='148', touch_repeats='1', before_touch='BRUSH')
+        self.carto()
+        self.scan(T=2, AXES='z', RANGE=0.3, PREPARE=1)
+        self.assertEqual(self.dock.scripts[5:11], ["SELECT_TOOL T=0 RESTORE_AXIS=''", 'M104 S148', 'BRUSH',
+                                                   'M109 S148', 'CARTOGRAPHER_TOUCH_HOME', 'M104 S0'])
+
+    def test_beacon_contact_homing_is_the_touch(self):
+        self.make()
+        self.carto({'stepper_z': {'endstop_pin': 'probe:z_virtual_endstop'}, 'beacon': {'home_method': 'contact'},
+                    'z_tilt': {}}, commands=())
+        self.scan(T=2, AXES='z', RANGE=0.3, PREPARE=1)
+        self.assertEqual(self.dock.scripts[:9], ['INITIALIZE_TOOLCHANGER', 'G28', 'Z_TILT_ADJUST',
+                                                 "SELECT_TOOL T=0 RESTORE_AXIS=''", 'M104 S150', 'M109 S150',
+                                                 'G28 Z', 'G28 Z', 'M104 S0'])
+
+    def test_failure_in_the_preparation_stops_with_a_report(self):
+        self.make()
+        self.carto()
+        real = self.printer.objects['gcode'].run_script_from_command
+
+        def run(script):
+            if script == 'QUAD_GANTRY_LEVEL':
+                raise CommandError('Probing failed')
+            return real(script)
+        self.printer.objects['gcode'].run_script_from_command = run
+        gcmd = FakeGcmd(T=2, PREPARE=1)
+        with self.assertRaises(CommandError):
+            self.module.cmd_DOCK_AUTOTUNE(gcmd)
+        self.assertEqual(self.dock.pickups, 0)
+        self.assertFalse(self.module.active)
+        self.assertIn('STOPPED', gcmd.text)
+
+    def test_explicit_prepare_without_a_way_to_home_is_refused(self):
+        self.make()
+        self.carto({'stepper_z': {'endstop_pin': 'tool_probe_endstop:z'}, 'tool_probe t0': {}})
+        with self.assertRaises(CommandError) as ctx:
+            self.scan(T=2, PREPARE=1)
+        self.assertIn('not possible', str(ctx.exception))
+        self.assertEqual(self.dock.scripts, [])
+
+    def test_prompt_without_a_way_to_home_offers_only_continue(self):
+        self.make()
+        self.carto({'stepper_z': {'endstop_pin': 'tool_probe_endstop:z'}, 'tool_probe t0': {}})
+        self.module.cmd_DOCK_AUTOTUNE(FakeGcmd(T=2))
+        text = '\n'.join(self.printer.objects['gcode'].raw)
+        self.assertIn('Preparation is not possible', text)
+        self.assertNotIn('PREPARE=1', text)
+        self.assertEqual(self.dock.scripts, [])
+
+    def test_prepare_0_needs_a_prepared_machine(self):
+        self.make()
+        self.carto()
+        self.printer.objects['toolhead'].homed = 'xy'
+        with self.assertRaises(CommandError) as ctx:
+            self.scan(T=2, PREPARE=0)
+        self.assertIn('PREPARE=1', str(ctx.exception))
+
+    def test_no_prompt_and_no_preparation_while_printing(self):
+        self.make()
+        self.carto()
+        self.stats.state = 'printing'
+        for params in ({'T': 2}, {'T': 2, 'PREPARE': 1}):
+            with self.assertRaises(CommandError):
+                self.module.cmd_DOCK_AUTOTUNE(FakeGcmd(**params))
+        self.assertEqual(self.printer.objects['gcode'].raw, [])
+        self.assertEqual(self.dock.scripts, [])
+
+    def test_bed_above_the_heater_limit_is_refused(self):
+        self.make()
+        self.carto()
+        with self.assertRaises(CommandError) as ctx:
+            self.scan(T=2, PREPARE=1, BED=200)
+        self.assertIn('max_temp', str(ctx.exception))
+
+    def test_dry_run_shows_the_preparation_and_moves_nothing(self):
+        self.make()
+        self.carto()
+        self.printer.objects['toolhead'].homed = ''
+        gcmd = FakeGcmd(T=2, DRY_RUN=1)
+        self.module.cmd_DOCK_AUTOTUNE(gcmd)
+        self.assertIn('M190 S70', gcmd.text)
+        self.assertIn('Cartographer', gcmd.text)
+        self.assertIn('nothing moved', gcmd.text)
+        self.assertEqual((self.dock.scripts, self.printer.objects['gcode'].raw), ([], []))
 
 
 if __name__ == '__main__':
