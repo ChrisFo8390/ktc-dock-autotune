@@ -27,6 +27,7 @@ export LC_ALL=C
 MODE="install"
 UPDATE_MANAGER="ask"
 RESTART="ask"
+MOONRAKER_CHANGED="no"
 
 for arg in "$@"; do
     case "${arg}" in
@@ -146,12 +147,13 @@ function add_update_manager {
         return
     fi
     if grep -qF "[update_manager ${REPO_NAME}]" "${conf}"; then
-        echo "[INFO] [update_manager ${REPO_NAME}] is already in ${conf} - not changed"
+        echo "[INFO] [update_manager ${REPO_NAME}] is already in ${conf} - not changed (restart Moonraker if it is not shown)"
         return
     fi
     cp "${conf}" "${conf}.bak.$(date +%Y%m%d%H%M%S)"
     printf "\n" >> "${conf}"
     print_update_manager_section >> "${conf}"
+    MOONRAKER_CHANGED="yes"
     echo "[INSTALL] Added [update_manager ${REPO_NAME}] to ${conf} (backup next to it)"
 }
 
@@ -168,13 +170,18 @@ EOF
 }
 
 function restart_klipper {
-    if ! decide "${RESTART}" "Restart Klipper now?"; then
-        echo "[INFO] Restart Klipper when you are ready:  sudo systemctl restart klipper"
+    local services="klipper"
+    # Moonraker reads moonraker.conf only at its start: without a restart the update manager entry does not show up
+    if [ "${MOONRAKER_CHANGED}" = "yes" ]; then
+        services="klipper moonraker"
+    fi
+    if ! decide "${RESTART}" "Restart ${services// / and } now?"; then
+        echo "[INFO] Restart when you are ready:  sudo systemctl restart ${services}"
         return
     fi
     if command -v systemctl >/dev/null 2>&1; then
-        sudo systemctl restart klipper
-        echo "[POST-INSTALL] Klipper restarted"
+        sudo systemctl restart ${services}
+        echo "[POST-INSTALL] Restarted: ${services}"
     else
         echo "[WARNING] systemctl not found, restart Klipper yourself"
     fi

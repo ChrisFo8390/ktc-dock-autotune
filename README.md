@@ -60,6 +60,12 @@ installed) and restart Klipper.
 
 Update with `git pull` in the clone (or the update manager) and restart Klipper.
 
+The update manager entry only shows up in Mainsail after **Moonraker** was restarted
+(`sudo systemctl restart moonraker`), a Klipper restart is not enough. It also needs the clone
+(`path:` in the entry) to be a Git repository of the printer user with the `origin` from the entry. A module copied
+by hand has no entry. Moonraker's own reasons for a missing or invalid entry are in
+`~/printer_data/logs/moonraker.log` (search for `update_manager`).
+
 Without Git: copy `klipper/extras/dock_autotune.py` to `~/klipper/klippy/extras/` and `config/dock_autotune.cfg`
 to the config directory by hand.
 
