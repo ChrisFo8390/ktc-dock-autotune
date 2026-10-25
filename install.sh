@@ -2,18 +2,22 @@
 # KTC Dock Autotune installer
 #
 # Links klipper/extras/dock_autotune.py into Klipper's extras directory, installs the
-# example configuration and (optionally) adds an update manager entry to moonraker.conf.
+# configuration, adds [include dock_autotune.cfg] to printer.cfg, adds an update manager entry
+# to moonraker.conf and restarts Klipper (and Moonraker, which only reads its config at start).
+# Backups of printer.cfg and moonraker.conf are made before they are changed.
 #
 # Usage (from a clone of the repository on the printer):
 #   git clone https://github.com/ChrisFo8390/ktc-dock-autotune.git ~/ktc-dock-autotune
 #   ~/ktc-dock-autotune/install.sh [options]
 #
-# Options (without them the script asks, but only when it runs in a terminal):
-#   --update-manager / --no-update-manager   add / do not add [update_manager ktc-dock-autotune]
-#   --restart / --no-restart                 restart / do not restart Klipper at the end
-#   --uninstall                              remove the link again (configuration is kept)
-#   -h, --help                               this text
+# Options:
+#   --no-include           do not touch printer.cfg
+#   --no-update-manager    do not touch moonraker.conf
+#   --no-restart           do not restart Klipper / Moonraker
+#   --uninstall            remove the link and the include line again (the rest is kept)
+#   -h, --help             this text
 #
+# Other locations: KLIPPER_PATH=... CONFIG_PATH=... ./install.sh
 # Update later: git pull in the clone (or the update manager), then restart Klipper.
 
 REPO_URL="https://github.com/ChrisFo8390/ktc-dock-autotune.git"
@@ -25,19 +29,20 @@ set -eu
 export LC_ALL=C
 
 MODE="install"
-UPDATE_MANAGER="ask"
-RESTART="ask"
-MOONRAKER_CHANGED="no"
+DO_INCLUDE="yes"
+DO_UPDATE_MANAGER="yes"
+DO_RESTART="yes"
+RESTART_MOONRAKER="no"
 
 for arg in "$@"; do
     case "${arg}" in
-        --update-manager)    UPDATE_MANAGER="yes" ;;
-        --no-update-manager) UPDATE_MANAGER="no" ;;
-        --restart)           RESTART="yes" ;;
-        --no-restart)        RESTART="no" ;;
+        --no-include)        DO_INCLUDE="no" ;;
+        --no-update-manager) DO_UPDATE_MANAGER="no" ;;
+        --no-restart)        DO_RESTART="no" ;;
+        --include|--update-manager|--restart) ;;    # the default since this version, kept for old command lines
         --uninstall)         MODE="uninstall" ;;
         -h|--help)
-            sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -56,22 +61,8 @@ else
     INSTALL_PATH="${INSTALL_PATH:-${HOME}/${REPO_NAME}}"
 fi
 EXTRAS="${KLIPPER_PATH}/klippy/extras"
-
-# ask <yes|no|ask> <question>: 0 = yes. Asks only in a terminal, otherwise the answer is no.
-function decide {
-    local preset="$1" question="$2" answer
-    case "${preset}" in
-        yes) return 0 ;;
-        no)  return 1 ;;
-    esac
-    if [ -t 0 ]; then
-        read -rp "${question} [y/N] " answer
-        case "${answer}" in
-            y|Y|yes|YES) return 0 ;;
-        esac
-    fi
-    return 1
-}
+INCLUDE_LINE="[include dock_autotune.cfg]"
+INCLUDE_PATTERN='^\[include[[:space:]]+dock_autotune\.cfg\][[:space:]]*$'     # [[:space:]] also matches a CR
 
 function preflight_checks {
     if [ "$EUID" -eq 0 ]; then
@@ -85,6 +76,17 @@ function preflight_checks {
     if [ ! -e "${EXTRAS}/toolchanger.py" ]; then
         echo "[WARNING] ${EXTRAS}/toolchanger.py not found: is klipper-toolchanger (KTC) installed?"
     fi
+}
+
+function backup_file {
+    local backup="$1.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$1" "${backup}"
+    echo "[INFO] Backup: ${backup}"
+}
+
+# True if the file has Windows line endings (tr instead of grep: grep ignores the CR in some environments)
+function has_crlf {
+    [ "$(tr -dc '\r' < "$1" | wc -c)" -gt 0 ]
 }
 
 function check_download {
@@ -117,6 +119,8 @@ function link_module {
 function install_config {
     if [ ! -d "${CONFIG_PATH}" ]; then
         echo "[WARNING] ${CONFIG_PATH} not found, configuration not installed (set CONFIG_PATH=...)"
+        DO_INCLUDE="no"
+        DO_UPDATE_MANAGER="no"
         return
     fi
     if [ ! -e "${CONFIG_PATH}/dock_autotune.cfg" ]; then
@@ -126,35 +130,43 @@ function install_config {
         echo "[INFO] ${CONFIG_PATH}/dock_autotune.cfg exists and is not overwritten"
         echo "[INFO] Compare it with ${INSTALL_PATH}/config/dock_autotune.cfg for new settings"
     fi
-    if [ ! -f "${CONFIG_PATH}/printer.cfg" ] || ! grep -qE '^\[include dock_autotune\.cfg\]' "${CONFIG_PATH}/printer.cfg"; then
-        echo "[INFO] Add this line to printer.cfg (the script does not edit it):"
-        echo ""
-        echo "    [include dock_autotune.cfg]"
-        echo ""
-    fi
 }
 
-function add_update_manager {
-    local conf="${CONFIG_PATH}/moonraker.conf"
-    if ! decide "${UPDATE_MANAGER}" "Add [update_manager ${REPO_NAME}] to moonraker.conf?"; then
-        echo "[INFO] Update manager entry skipped"
+# Adds [include dock_autotune.cfg] to printer.cfg: above the SAVE_CONFIG block if there is one
+# (everything below it belongs to Klipper), otherwise at the end. Keeps the line endings of the file.
+function add_include {
+    local cfg="${CONFIG_PATH}/printer.cfg"
+    if [ "${DO_INCLUDE}" != "yes" ]; then
+        echo "[INFO] printer.cfg not changed, add this line yourself:  ${INCLUDE_LINE}"
         return
     fi
-    if [ ! -f "${conf}" ]; then
-        echo "[WARNING] ${conf} not found, add this section yourself:"
-        echo ""
-        print_update_manager_section
+    if [ ! -f "${cfg}" ]; then
+        echo "[WARNING] ${cfg} not found, add this line yourself:  ${INCLUDE_LINE}"
         return
     fi
-    if grep -qF "[update_manager ${REPO_NAME}]" "${conf}"; then
-        echo "[INFO] [update_manager ${REPO_NAME}] is already in ${conf} - not changed (restart Moonraker if it is not shown)"
+    if grep -qE "${INCLUDE_PATTERN}" "${cfg}"; then
+        echo "[INFO] ${INCLUDE_LINE} is already in printer.cfg"
         return
     fi
-    cp "${conf}" "${conf}.bak.$(date +%Y%m%d%H%M%S)"
-    printf "\n" >> "${conf}"
-    print_update_manager_section >> "${conf}"
-    MOONRAKER_CHANGED="yes"
-    echo "[INSTALL] Added [update_manager ${REPO_NAME}] to ${conf} (backup next to it)"
+    backup_file "${cfg}"
+    local cr="" marker tmp
+    if has_crlf "${cfg}"; then
+        cr=$'\r'
+    fi
+    marker="$(grep -nE '^#\*# <-+ SAVE_CONFIG -+>' "${cfg}" | head -n 1 | cut -d: -f1 || true)"
+    tmp="$(mktemp)"
+    if [ -n "${marker}" ]; then
+        awk -v n="${marker}" -v line="${INCLUDE_LINE}" -v cr="${cr}" \
+            'NR == n { printf "%s%s\n%s\n", line, cr, cr } { print }' "${cfg}" > "${tmp}"
+    else
+        { cat "${cfg}"
+          if [ -n "$(tail -c 1 "${cfg}")" ]; then printf '%s\n' "${cr}"; fi
+          printf '%s\n%s%s\n' "${cr}" "${INCLUDE_LINE}" "${cr}"
+        } > "${tmp}"
+    fi
+    cat "${tmp}" > "${cfg}"      # not mv: keeps owner and permissions of printer.cfg
+    rm -f "${tmp}"
+    echo "[INSTALL] Added ${INCLUDE_LINE} to ${cfg}"
 }
 
 function print_update_manager_section {
@@ -169,26 +181,65 @@ managed_services: klipper
 EOF
 }
 
-function restart_klipper {
+function add_update_manager {
+    local conf="${CONFIG_PATH}/moonraker.conf"
+    if [ "${DO_UPDATE_MANAGER}" != "yes" ]; then
+        echo "[INFO] moonraker.conf not changed"
+        return
+    fi
+    if [ ! -f "${conf}" ]; then
+        echo "[WARNING] ${conf} not found, add this section yourself:"
+        echo ""
+        print_update_manager_section
+        return
+    fi
+    if grep -qF "[update_manager ${REPO_NAME}]" "${conf}"; then
+        echo "[INFO] [update_manager ${REPO_NAME}] is already in ${conf} - not changed"
+        return
+    fi
+    backup_file "${conf}"
+    local cr=""
+    if has_crlf "${conf}"; then
+        cr=$'\r'
+    fi
+    {
+        if [ -n "$(tail -c 1 "${conf}")" ]; then printf '%s\n' "${cr}"; fi
+        printf '%s\n' "${cr}"
+        print_update_manager_section | sed "s/\$/${cr}/"
+    } >> "${conf}"
+    RESTART_MOONRAKER="yes"     # Moonraker reads moonraker.conf only when it starts
+    echo "[INSTALL] Added [update_manager ${REPO_NAME}] to ${conf}"
+}
+
+function restart_services {
     local services="klipper"
-    # Moonraker reads moonraker.conf only at its start: without a restart the update manager entry does not show up
-    if [ "${MOONRAKER_CHANGED}" = "yes" ]; then
+    if [ "${RESTART_MOONRAKER}" = "yes" ]; then
         services="klipper moonraker"
     fi
-    if ! decide "${RESTART}" "Restart ${services// / and } now?"; then
+    if [ "${DO_RESTART}" != "yes" ]; then
         echo "[INFO] Restart when you are ready:  sudo systemctl restart ${services}"
         return
     fi
-    if command -v systemctl >/dev/null 2>&1; then
-        sudo systemctl restart ${services}
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "[WARNING] systemctl not found, restart yourself: ${services}"
+        return
+    fi
+    # shellcheck disable=SC2086
+    if sudo systemctl restart ${services}; then
         echo "[POST-INSTALL] Restarted: ${services}"
     else
-        echo "[WARNING] systemctl not found, restart Klipper yourself"
+        echo "[WARNING] Restart failed, run it yourself:  sudo systemctl restart ${services}"
     fi
 }
 
 function uninstall {
     local target="${EXTRAS}/dock_autotune.py"
+    local cfg="${CONFIG_PATH}/printer.cfg"
+    if [ -f "${cfg}" ] && grep -qE "${INCLUDE_PATTERN}" "${cfg}"; then
+        backup_file "${cfg}"
+        sed -i -E "/${INCLUDE_PATTERN}/d" "${cfg}"
+        echo "[UNINSTALL] Removed ${INCLUDE_LINE} from printer.cfg"
+    fi
     if [ -L "${target}" ]; then
         rm -f "${target}"
         echo "[UNINSTALL] Removed ${target}"
@@ -197,9 +248,8 @@ function uninstall {
     else
         echo "[INFO] ${target} is not installed"
     fi
-    echo "[INFO] Not touched: ${CONFIG_PATH}/dock_autotune.cfg, the include line in printer.cfg and the"
-    echo "[INFO] update manager section in moonraker.conf. Remove the include line before the next restart,"
-    echo "[INFO] otherwise Klipper stops with: Section 'dock_autotune' is not a valid config section."
+    echo "[INFO] Not touched: ${CONFIG_PATH}/dock_autotune.cfg and the update manager section in moonraker.conf."
+    restart_services
 }
 
 function show_completion_message {
@@ -209,10 +259,9 @@ function show_completion_message {
 Installation complete
 ========================================
 Next steps:
-  1. Add  [include dock_autotune.cfg]  to printer.cfg (if not there yet)
-  2. Make sure the error_gcode of your toolchanger leaves the dock after a failed pickup and does not
+  1. Make sure the error_gcode of your toolchanger leaves the dock after a failed pickup and does not
      pause while a scan runs, see ${INSTALL_PATH}/examples/toolchanger-error-handler.cfg
-  3. Restart Klipper, then try:  DOCK_AUTOTUNE T=1 DRY_RUN=1
+  2. Try:  DOCK_AUTOTUNE T=1 DRY_RUN=1
 Documentation: ${INSTALL_PATH}/README.md
 EOF
 }
@@ -229,6 +278,7 @@ fi
 check_download
 link_module
 install_config
+add_include
 add_update_manager
-restart_klipper
+restart_services
 show_completion_message

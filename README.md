@@ -45,26 +45,32 @@ git clone https://github.com/ChrisFo8390/ktc-dock-autotune.git ~/ktc-dock-autotu
 ~/ktc-dock-autotune/install.sh
 ```
 
-The installer links `klipper/extras/dock_autotune.py` into Klipper, copies `config/dock_autotune.cfg` to your
-config directory (an existing file is never overwritten) and can add an `[update_manager]` entry to
-`moonraker.conf` (a backup is made first). Then add `[include dock_autotune.cfg]` to `printer.cfg`
-(the script does not edit it, and Klipper refuses to start with the include before the module is
-installed) and restart Klipper.
+The installer does everything in one go:
+
+* links `klipper/extras/dock_autotune.py` into Klipper and copies `config/dock_autotune.cfg` to your config
+  directory (an existing file is never overwritten),
+* adds `[include dock_autotune.cfg]` to `printer.cfg` (above the `SAVE_CONFIG` block, line endings kept),
+* adds the `[update_manager ktc-dock-autotune]` entry to `moonraker.conf`,
+* restarts Klipper, and Moonraker if it changed `moonraker.conf` (Moonraker reads its config only at start,
+  without that restart the entry does not show up in Mainsail). `sudo` must work without a password,
+  otherwise the script prints the command to run.
+
+Backups (`printer.cfg.bak.<date>`, `moonraker.conf.bak.<date>`) are made before a file is changed. Running it
+again changes nothing that is already there.
 
 | Option | |
 |---|---|
-| `--update-manager` / `--no-update-manager` | add / skip the Moonraker update manager entry (default: ask in a terminal) |
-| `--restart` / `--no-restart` | restart / do not restart Klipper (default: ask in a terminal) |
-| `--uninstall` | remove the link again (config, include line and update manager entry stay) |
+| `--no-include` | do not touch `printer.cfg` (add `[include dock_autotune.cfg]` yourself) |
+| `--no-update-manager` | do not touch `moonraker.conf` |
+| `--no-restart` | do not restart anything |
+| `--uninstall` | remove the link and the include line (`dock_autotune.cfg` and the update manager entry stay) |
 | `KLIPPER_PATH=…`, `CONFIG_PATH=…` | other locations than `~/klipper` and `~/printer_data/config` |
 
 Update with `git pull` in the clone (or the update manager) and restart Klipper.
 
-The update manager entry only shows up in Mainsail after **Moonraker** was restarted
-(`sudo systemctl restart moonraker`), a Klipper restart is not enough. It also needs the clone
-(`path:` in the entry) to be a Git repository of the printer user with the `origin` from the entry. A module copied
-by hand has no entry. Moonraker's own reasons for a missing or invalid entry are in
-`~/printer_data/logs/moonraker.log` (search for `update_manager`).
+The update manager needs the clone (`path:` in the entry) to be a Git repository of the printer user with the
+`origin` from the entry. A module copied by hand has no entry. Moonraker's reasons for a missing or invalid
+entry are in `~/printer_data/logs/moonraker.log` (search for `update_manager`).
 
 Without Git: copy `klipper/extras/dock_autotune.py` to `~/klipper/klippy/extras/` and `config/dock_autotune.cfg`
 to the config directory by hand.
