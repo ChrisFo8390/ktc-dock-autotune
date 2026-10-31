@@ -1178,10 +1178,13 @@ class DockAutotune:
         if status.get('detected_tool_number', -1) != -1:
             raise AbortScan('a tool is detected on the shuttle (T%s): the shuttle has to be empty'
                             % status.get('detected_tool_number'))
+        # anywhere outside of the dock is fine, the entry starts with the move to close_y like the pickup_gcode; inside
+        # of the dock (nearer than the start of the pickup path) the first move could hit it
         position = self.printer.lookup_object('toolhead').get_status(self._now())['position']
-        if position[1] < sp['close_y'] - 1.0:
-            raise AbortScan('the shuttle is at Y=%.1f, in front of the docks (close Y %.1f): move it to Y=%.1f '
-                            'first' % (position[1], sp['close_y'], sp['safe_y']))
+        nearest = sp['y'] + sp['geo']['approach'][0]['y'] + 5.0
+        if position[1] < nearest:
+            raise AbortScan('the shuttle is at Y=%.1f, inside of the dock (the pickup path starts at Y=%.1f): move it '
+                            'out to Y=%.1f first' % (position[1], nearest - 5.0, sp['safe_y']))
 
     def _seat_leave(self, sp):
         _, leave = self._seat_plan(sp)

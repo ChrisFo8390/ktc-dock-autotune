@@ -202,7 +202,7 @@ velocity change in x and y with its sign.
   sign changes, the pins find their holes without being pushed. Whether this gives a clean answer on your machine has
   to be looked at in the first maps; nothing is applied.
 
-Requirements as for the map ([adxl345 T<n>] per tool) and a shuttle that is in front of the docks and empty. The moves
+Requirements as for the map ([adxl345 T<n>] per tool) and an empty shuttle that is not inside of a dock. The moves
 are not made by `SELECT_TOOL`: be at the machine for the first run.
 
 ## Result file

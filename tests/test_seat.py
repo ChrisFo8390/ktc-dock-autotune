@@ -421,12 +421,20 @@ class SeatCommandTests(unittest.TestCase):
 
     def test_the_shuttle_must_be_outside_and_empty(self):
         self.make()
-        self.rig.pos = [149.6, 0.0, 266.2]
-        self.assertIn('in front of the docks', self.seat(T=2, AXES='x', RANGE=0.25).text)
+        self.rig.pos = [149.6, -20.0, 266.2]
+        self.assertIn('inside of the dock', self.seat(T=2, AXES='x', RANGE=0.25).text)
         self.make()
         self.dock.detected = 1
         self.assertIn('a tool is detected on the shuttle', self.seat(T=2, AXES='x', RANGE=0.25).text)
         self.assertEqual([s for s in self.dock.scripts if s.startswith('G0')], [])
+
+    def test_the_shuttle_may_be_anywhere_outside_of_the_dock(self):
+        # after a preparation without touch homing it stands where the levelling left it
+        self.make()
+        self.rig.pos = [150.0, 10.0, 200.0]
+        gcmd = self.seat(T=2, AXES='', REPEATS=1)
+        self.assertNotIn('STOPPED', gcmd.text)
+        self.assertEqual(self.rig.pos[1], 100.0)
 
     def test_interrupt_leaves_the_dock(self):
         self.make()
