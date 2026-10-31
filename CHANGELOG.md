@@ -2,7 +2,7 @@
 
 The project is a prototype; the entries explain what changed and why, newest first.
 
-## 2026-11-01: a chart instead of tables
+## 2026-10-31 (23:00): a chart instead of tables
 
 The console and the result file were too hard to read. Now every axis is a small chart (offset, position, a bar for how
 much the tool moved, and a word: quiet, rough, LOUD, FAIL) with a one-line verdict, then the table with the current and
