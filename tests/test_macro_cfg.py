@@ -66,8 +66,8 @@ class MacroTests(unittest.TestCase):
     def test_every_field_of_the_ui_is_a_parameter_of_the_macro(self):
         # Mainsail makes an input field of every params.<NAME> in the macro
         gcode = read_macro()['gcode']
-        for name in ('T', 'AXES', 'RANGE', 'STEP', 'REPEATS', 'SPEED', 'BED', 'SOAK', 'PREPARE', 'TOUCH', 'ADXL',
-                     'MODE', 'RAW', 'DRY_RUN'):
+        for name in ('T', 'TOOLS', 'AXES', 'RANGE', 'STEP', 'REPEATS', 'SPEED', 'BED', 'SOAK', 'PREPARE', 'TOUCH',
+                     'MODE', 'DRY_RUN'):
             self.assertIn('params.%s' % name, gcode)
 
 

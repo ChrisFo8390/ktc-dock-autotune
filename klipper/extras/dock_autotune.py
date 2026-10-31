@@ -17,9 +17,9 @@
 # Commands: DOCK_AUTOTUNE_RUN (always) and DOCK_AUTOTUNE (the same, unless a macro of that name is
 # configured, see config/dock_autotune_macro.cfg), DOCK_AUTOTUNE_INTERRUPT.
 #
-# Optionally the accelerometer of the tool is recorded during every trial (peak and RMS of
-# the shock, written to the log). It only helps to judge a position and to stop a scan when
-# something hits hard (abort_g); it never decides on its own.
+# MODE=seat (the default) does not pick the tool up: the empty shuttle lifts into the tool in its dock up to
+# the verify waypoint and down again, the accelerometer of the tool measures where the contact is and how it
+# is pushed sideways. MODE=scan looks for the window of positions in which the tool locks and centres it.
 #
 # Copyright (C) 2026
 # This file may be distributed under the terms of the GNU GPLv3 license.
@@ -90,28 +90,8 @@ def window_center(edges):
     return (edges['plus'] + edges['minus']) / 2.0
 
 
-def shock_metrics(samples):
-    """
-    Shock numbers of accelerometer samples [(time, x, y, z), ...] in mm/s^2, in g.
-    The static part (gravity, orientation) is the median of each axis over the samples.
-    peak_dev_g:   largest deviation from that median
-    peak_delta_g: largest change between two consecutive samples (a knock, not a tilt)
-    rms_g:        RMS of the deviation
-    """
-    if not samples or len(samples) < 3:
-        return None
-    columns = list(zip(*[(s[1], s[2], s[3]) for s in samples]))
-    medians = [sorted(c)[len(c) // 2] for c in columns]
-    dev = [math.sqrt(sum((v - m) ** 2 for v, m in zip(s[1:4], medians))) / FREEFALL for s in samples]
-    delta = [math.sqrt(sum((a - b) ** 2 for a, b in zip(s[1:4], p[1:4]))) / FREEFALL
-             for p, s in zip(samples, samples[1:])]
-    return {'samples': len(samples), 'peak_dev_g': round(max(dev), 3),
-            'peak_delta_g': round(max(delta), 3),
-            'rms_g': round(math.sqrt(sum(d * d for d in dev) / len(dev)), 3)}
-
-
 # ---------------------------------------------------------------------------
-# ADXL map: what the accelerometer of the tool sees while it is picked up (pure, used by the tests)
+# Accelerometer: what the tool sees while the shuttle takes it up (pure, used by the tests)
 # ---------------------------------------------------------------------------
 
 def residuals(samples, window=0.05):
@@ -155,62 +135,12 @@ def knock_metrics(samples, t_from, t_to, window=0.05):
             'rms_g': round(math.sqrt(sum(v * v for v in norms) / len(norms)), 4)}
 
 
-def csv_snippet(samples, t_from, t_to, t_peak, half=0.25, window=0.05):
-    """CSV lines (time after t_from, raw x, y, z in g, residual x, y, z in g) around the peak"""
-    part = [s for s in samples if t_from <= s[0] <= t_to]
-    if len(part) < 20:
-        return []
-    times, _, (rx, ry, rz) = residuals(part, window)
-    lines = ['time_s,x_g,y_g,z_g,res_x_g,res_y_g,res_z_g']
-    for i, s in enumerate(part):
-        if abs(times[i] - t_from - t_peak) <= half:
-            lines.append('%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f' % (
-                times[i] - t_from, s[1] / FREEFALL, s[2] / FREEFALL, s[3] / FREEFALL, rx[i], ry[i], rz[i]))
-    return lines
-
-
 def median(values):
     values = sorted(values)
     n = len(values)
     if n == 0:
         return None
     return values[n // 2] if n % 2 else (values[n // 2 - 1] + values[n // 2]) / 2.0
-
-
-def zero_crossings(rows, key):
-    """Offsets at which the median component `key` of the map changes sign (linear between two positions)"""
-    points = [(r['offset'], r['pick'][key]) for r in rows if r['ok'] and r.get('pick')]
-    points.sort()
-    found = []
-    for (o1, v1), (o2, v2) in zip(points, points[1:]):
-        if v1 * v2 < 0:
-            found.append(round(o1 + (o2 - o1) * v1 / (v1 - v2), 3))
-    return found
-
-
-def map_table(tool, axis, rows, window):
-    """The map of one axis as text lines. rows: offset, value, locked, total, ok, pick, drop"""
-    lines = ["ADXL map T%d %s: knock in g after a %d ms high-pass, signed components at the peak of the pickup "
-             "(median of the repeats; x y z are the axes of the chip after axes_map)" % (
-                 tool, axis.upper(), int(round(window * 1000))),
-             " offset      value  locked   pickup      x      y      z  t_peak  dropoff"]
-    for r in sorted(rows, key=lambda r: r['offset']):
-        pick, drop = r.get('pick'), r.get('drop')
-        lines.append("%+7.2f  %9.3f  %d/%d    %s  %s" % (
-            r['offset'], r['value'], r['locked'], r['total'],
-            ("%7.3f %6.2f %6.2f %6.2f %6.2f s" % (pick['peak_g'], pick['x'], pick['y'], pick['z'], pick['t_peak'])
-             if pick else "      -      -      -      -       -"),
-            ("%7.3f" % drop['peak_g']) if drop else "      -"))
-    good = [r for r in rows if r['ok'] and r.get('pick')]
-    if good:
-        quiet = min(good, key=lambda r: r['pick']['peak_g'])
-        lines.append("Quietest pickup: %+.2f mm (%.3f g)" % (quiet['offset'], quiet['pick']['peak_g']))
-        for key in 'xyz':
-            crossings = zero_crossings(rows, key)
-            if crossings:
-                lines.append("Component %s changes sign at %s mm" % (key, ', '.join('%+.2f' % c for c in crossings)))
-    lines.append("Nothing is changed by a map. Locked = pickups that locked / tried.")
-    return lines
 
 
 def _park_result(axis, info):
@@ -222,8 +152,6 @@ def _park_result(axis, info):
             return before, 'height of the contact measured, not changed by the seat test'
         return before, ('measured, not changed by the seat test' if axis in info.get('seat', {}).get('rows', {})
                         else 'not measured')
-    if info['mode'] == 'map':
-        return before, ('measured, not changed by a map' if axis in info.get('map', {}) else 'not measured')
     if info.get('new', {}).get(axis) is not None:
         return info['new'][axis], 'centred, window %+.3f .. %+.3f mm (%.3f wide)' % (
             entry['minus'], entry['plus'], entry['width'])
@@ -238,13 +166,12 @@ def _park_result(axis, info):
 
 def build_report(info):
     """
-    The result file of one run as text: the park positions (before, after), the ADXL measurements or the trials of the
-    scan, and all numbers as CSV. info: time, tool, mode, status, pickups, settings (list of text), originals, new,
-    scan (result per axis), trials, map (rows per axis), seat (rows per axis and the height of the lift), window,
-    raw_dir
+    The result file of one run as text: the park positions (before, after), the measurements of the seat test or the
+    trials of the scan, and all numbers as CSV. info: time, tool, mode, status, pickups, settings (list of text),
+    originals, new, scan (result per axis), trials, seat (rows per axis and the height of the lift), window
     """
     tool = info['tool']
-    lines = ["Dock autotune T%d - %s - %s" % (tool, {'map': 'ADXL map', 'seat': 'seat test'}.get(info['mode'], 'scan'), info['time']),
+    lines = ["Dock autotune T%d - %s - %s" % (tool, 'seat test' if info['mode'] == 'seat' else 'scan', info['time']),
              "Status: %s (%d %s)" % (info['status'], info['pickups'], 'lifts' if info['mode'] == 'seat' else 'pickups'),
              "Settings: " + ', '.join(info['settings']), "",
              "Park positions of T%d" % tool,
@@ -269,19 +196,13 @@ def build_report(info):
                 lines.append("")
                 lines.extend(seat_table(tool, axis, info['seat']['rows'][axis], info['window']))
     for axis in AXES:
-        if info.get('map', {}).get(axis):
-            lines.append("")
-            lines.extend(map_table(tool, axis, info['map'][axis], info['window']))
-    for axis in AXES:
         trials = [t for t in info.get('trials', []) if t['axis'] == axis]
         if trials:
             start = info['originals'][axis]
             lines.extend(["", "Scan trials %s in the order they were made (offset from the start value %.3f)"
-                          % (axis.upper(), start), " offset      value  result  peak_g"])
+                          % (axis.upper(), start), " offset      value  result"])
             for t in trials:
-                lines.append("%+7.3f  %9.3f  %-6s  %s" % (
-                    t['value'] - start, t['value'], 'locked' if t['ok'] else 'FAILED',
-                    '%6.3f' % t['peak_g'] if t['peak_g'] is not None else '     -'))
+                lines.append("%+7.3f  %9.3f  %s" % (t['value'] - start, t['value'], 'locked' if t['ok'] else 'FAILED'))
     lines.extend(["", "Data (CSV)"])
     if info['mode'] == 'seat':
         lines.append("tool,axis,offset_mm,value_mm,pin_ok,pin_total,events,z_first,z_last,peak_first_g,peak_last_g,"
@@ -291,24 +212,12 @@ def build_report(info):
                 lines.append(','.join('' if v is None else str(v) for v in (
                     tool, axis, r['offset'], r['value'], r['pin'], r['total'], r['events'], r['z_first'],
                     r['z_last'], r['peak_first'], r['peak_last'], r['lateral'], r['ix'], r['iy'], r['release_g'])))
-    elif info['mode'] == 'map':
-        lines.append("tool,axis,offset_mm,value_mm,locked,total,pick_peak_g,pick_x_g,pick_y_g,pick_z_g,pick_t_peak_s,"
-                     "pick_rms_g,drop_peak_g")
-        for axis in AXES:
-            for r in sorted(info.get('map', {}).get(axis, []), key=lambda r: r['offset']):
-                pick, drop = r.get('pick') or {}, r.get('drop') or {}
-                lines.append(','.join(str(v) for v in (
-                    tool, axis, r['offset'], r['value'], r['locked'], r['total'], pick.get('peak_g', ''),
-                    pick.get('x', ''), pick.get('y', ''), pick.get('z', ''), pick.get('t_peak', ''),
-                    pick.get('rms_g', ''), drop.get('peak_g', ''))))
     else:
-        lines.append("tool,axis,offset_mm,value_mm,locked,peak_g")
+        lines.append("tool,axis,offset_mm,value_mm,locked")
         for t in info.get('trials', []):
             lines.append(','.join(str(v) for v in (
                 tool, t['axis'], round(t['value'] - info['originals'][t['axis']], 4), t['value'],
-                1 if t['ok'] else 0, '' if t['peak_g'] is None else t['peak_g'])))
-    if info.get('raw_dir'):
-        lines.extend(["", "Raw samples around the peak of every pickup (CSV): %s" % info['raw_dir']])
+                1 if t['ok'] else 0)))
     return '\n'.join(lines) + '\n'
 
 
@@ -344,7 +253,7 @@ def parse_tool_list(text, known=None):
 def build_multi_report(runs, numbers, mode, when):
     """The result file of a run over several tools: how each tool ended, the park positions of all of them (and
     the lines for the tool files), then the full report of every tool. runs: number, status, info (or None)"""
-    names = {'map': 'ADXL map', 'seat': 'seat test'}
+    names = {'seat': 'seat test'}
     lines = ["Dock autotune %s - %s - %s" % (', '.join('T%d' % n for n in numbers), names.get(mode, 'scan'), when),
              "Tools:"]
     done = {r['number']: r for r in runs}
@@ -712,8 +621,7 @@ def build_prompt(number, params, setup, plan, bed, touch_cmd):
 
 MODE_TEXTS = {'seat': 'seat test (the shuttle lifts into the tool without taking it out of its dock, nothing is '
                       'changed)',
-              'scan': 'scan (finds the window in which the tool locks and centres the dock position)',
-              'map': 'ADXL map (measures the knock of full pickups, nothing is changed)'}
+              'scan': 'scan (finds the window in which the tool locks and centres the dock position)'}
 
 
 def build_tool_prompt(params, numbers, mode='seat'):
@@ -774,17 +682,13 @@ class DockAutotune:
         self.before_touch = [l.strip() for l in config.get('before_touch', '').splitlines() if l.strip()]
         # Accelerometer of the tool: "adxl345 T{tool}" (the section must be named per tool)
         self.accel_chip = config.get('accelerometer', 'adxl345 T{tool}')
-        self.abort_g = config.getfloat('abort_g', 0., minval=0.)
-        # ADXL map (MODE=map): high-pass window of the knock metric, step and repeats of the grid, how many
-        # failed positions in a row end one side of the grid
+        # seat test (MODE=seat): lift into the shuttle without leaving the dock. adxl_window is the window (s) of the
+        # high-pass that removes gravity and the smooth acceleration of the moves, seat_speed the speed (mm/s) of the
+        # part around the contact, which starts seat_zone mm below the first knock; the XY positions go seat_range mm
+        # to both sides in seat_step steps with seat_repeats lifts each, a side ends after seat_fail_stop positions
+        # in a row where the tool detection was off at the top
         self.adxl_window = config.getfloat('adxl_window', 0.05, above=0.)
-        self.map_step = config.getfloat('map_step', 0.25, above=0.)
-        self.map_repeats = config.getint('map_repeats', 3, minval=1)
-        self.map_fail_stop = config.getint('map_fail_stop', 2, minval=1)
-        self.map_range = config.getfloat('map_range', 1.5, above=0.)
-        # seat test (MODE=seat): lift into the shuttle without leaving the dock. seat_speed is the speed (mm/s)
-        # of the part around the contact, which starts seat_zone mm below the first knock; the XY positions go
-        # seat_range mm to both sides in seat_step steps with seat_repeats lifts each
+        self.seat_fail_stop = config.getint('seat_fail_stop', 2, minval=1)
         self.seat_speed = config.getfloat('seat_speed', 2., above=0.)
         self.seat_zone = config.getfloat('seat_zone', 1.5, minval=0.)
         self.seat_range = config.getfloat('seat_range', 1., above=0.)
@@ -793,12 +697,10 @@ class DockAutotune:
         self.seat_threshold = config.getfloat('seat_threshold', 0., minval=0.)
         # defaults of the command line: DOCK_AUTOTUNE T=0 alone does what these say
         self.mode = config.get('mode', 'seat').strip().lower()
-        if self.mode not in ('scan', 'map', 'seat'):
-            raise config.error("dock_autotune: mode must be scan, map or seat")
+        if self.mode not in ('scan', 'seat'):
+            raise config.error("dock_autotune: mode must be seat or scan")
         self.axes = ''.join(a for a in config.get('axes', AXES).lower() if a in AXES) or AXES
         self.tools_default = config.get('tools', '').strip()
-        self.adxl_default = config.getboolean('adxl', False)
-        self.raw_default = config.getboolean('adxl_raw', False)
         prepare = config.get('prepare', 'ask').strip().lower()
         if prepare not in PREPARE_CHOICES:
             raise config.error("dock_autotune: prepare must be ask, yes or no")
@@ -808,14 +710,10 @@ class DockAutotune:
             config.get('results_dir', '~/printer_data/config/dock_autotune/results').strip())
         self.log_file = os.path.expanduser(
             config.get('log_file', '~/printer_data/logs/dock_autotune.jsonl'))
-        self.raw_dir = os.path.join(os.path.dirname(self.log_file), 'dock_autotune_adxl')
         self.active = False
         self.abort = False
-        self.use_adxl = False
-        self.last_samples = None        # accelerometer samples of the last cycle, and when its pickup ended
-        self.last_pick_end = None
+        self.last_samples = None        # accelerometer samples of the last lift
         self.trial_rows = []            # data of the run for the result file
-        self.map_rows = {}
         self.seat_rows = {}
         self.seat_info = {}
         self.scan_result = {}
@@ -871,11 +769,9 @@ class DockAutotune:
         except OSError:
             logging.exception("dock_autotune: cannot write %s", self.log_file)
 
-    # -- accelerometer (optional) ----------------------------------------------
+    # -- accelerometer (seat test) ------------------------------------------------
 
     def _adxl_start(self, tool_number):
-        if not self.use_adxl:
-            return None
         chip = self.printer.lookup_object(self.accel_chip.format(tool=tool_number), None)
         if chip is None or not hasattr(chip, 'start_internal_client'):
             return None
@@ -888,14 +784,12 @@ class DockAutotune:
     def _adxl_finish(self, client):
         self.last_samples = None
         if client is None:
-            return None
+            return
         try:
             client.finish_measurements()
             self.last_samples = client.get_samples()
-            return shock_metrics(self.last_samples)
         except Exception:
             logging.exception("dock_autotune: accelerometer read failed")
-            return None
 
     # -- preparation like a print start ------------------------------------------
 
@@ -956,13 +850,11 @@ class DockAutotune:
     # -- one pickup + dropoff ---------------------------------------------------
 
     def _cycle(self, tool_number):
-        """One pickup and dropoff. Returns (picked, error message, shock metrics)."""
+        """One pickup and dropoff. Returns (picked, error message)."""
         self._check_abort()
         self.cycles += 1
         if self.cycles > self.max_cycles:
             raise AbortScan('max_cycles (%d) reached' % self.max_cycles)
-        client = self._adxl_start(tool_number)
-        self.last_pick_end = None
         picked, error = True, ''
         try:
             self._run("SELECT_TOOL T=%d %s" % (tool_number, RESTORE_NONE))
@@ -973,20 +865,12 @@ class DockAutotune:
             picked = status['status'] == 'ready' and status['tool_number'] == tool_number
             error = '' if picked else 'toolchanger %s, tool %s' % (status['status'], status['tool_number'])
         if picked:
-            if client is not None:
-                # where the pickup ends and the dropoff begins, for the ADXL map
-                toolhead = self.printer.lookup_object('toolhead')
-                toolhead.wait_moves()
-                self.last_pick_end = toolhead.get_last_move_time()
             # An error while the tool is put back is not a trial result: the scan stops
             self._run("UNSELECT_TOOL %s" % RESTORE_NONE)
             self._wait()
         else:
             self._recover(tool_number)
-        metrics = self._adxl_finish(client)
-        if metrics and self.abort_g and metrics['peak_dev_g'] > self.abort_g:
-            raise AbortScan('shock %.1f g is above abort_g %.1f g' % (metrics['peak_dev_g'], self.abort_g))
-        return picked, error, metrics
+        return picked, error
 
     def _wait(self):
         toolhead = self.printer.lookup_object('toolhead')
@@ -1021,19 +905,14 @@ class DockAutotune:
         """Set the park value and try pickup + dropoff `repeats` times"""
         tool.set_parameter('params_park_%s' % axis, round(value, 4))
         self.state['trial'] += 1
-        shocks = []
         ok, error = True, ''
         for _ in range(self.repeats):
-            picked, error, metrics = self._cycle(tool.tool_number)
-            if metrics:
-                shocks.append(metrics['peak_dev_g'])
+            picked, error = self._cycle(tool.tool_number)
             if not picked:
                 ok = False
                 break
-        peak = max(shocks) if shocks else None
-        self._log({'tool': tool.tool_number, 'axis': axis, 'value': round(value, 4), 'ok': ok,
-                   'peak_g': peak, 'error': error})
-        self.trial_rows.append({'axis': axis, 'value': round(value, 4), 'ok': ok, 'peak_g': peak})
+        self._log({'tool': tool.tool_number, 'axis': axis, 'value': round(value, 4), 'ok': ok, 'error': error})
+        self.trial_rows.append({'axis': axis, 'value': round(value, 4), 'ok': ok})
         return ok
 
     # -- the scan -----------------------------------------------------------------
@@ -1081,92 +960,7 @@ class DockAutotune:
                                       % (number, axis.upper()))
         return base, result
 
-    # -- the ADXL map ---------------------------------------------------------------
-
-    def _map_cycle(self, tool_number):
-        """One pickup and dropoff with the accelerometer. Returns (picked, error, pickup knock, dropoff knock,
-        csv lines of the pickup)"""
-        picked, error, _ = self._cycle(tool_number)
-        samples = self.last_samples
-        if not samples:
-            return picked, error, None, None, []
-        start, end = samples[0][0], samples[-1][0]
-        mid = self.last_pick_end if (picked and self.last_pick_end is not None) else end
-        pick = knock_metrics(samples, start, mid, self.adxl_window)
-        drop = knock_metrics(samples, mid, end, self.adxl_window) if picked else None
-        snippet = csv_snippet(samples, start, mid, pick['t_peak'], window=self.adxl_window) if pick else []
-        return picked, error, pick, drop, snippet
-
-    def _map_trial(self, tool, axis, offset, base, repeats, raw):
-        """Set the park value and take `repeats` pickups with the accelerometer"""
-        value = round(base + offset, 4)
-        tool.set_parameter('params_park_%s' % axis, value)
-        self.state['trial'] += 1
-        picks, drops, locked, error = [], [], 0, ''
-        for repeat in range(repeats):
-            picked, error, pick, drop, snippet = self._map_cycle(tool.tool_number)
-            if picked:
-                locked += 1
-            if pick:
-                picks.append(pick)
-            if drop:
-                drops.append(drop)
-            if raw and snippet:
-                self._save_snippet(tool.tool_number, axis, offset, repeat + 1, snippet)
-            if not picked:
-                break
-        row = {'offset': round(offset, 4), 'value': value, 'locked': locked, 'total': repeats,
-               'ok': locked == repeats, 'error': error, 'pick': None, 'drop': None}
-        for name, items in (('pick', picks), ('drop', drops)):
-            if items:
-                row[name] = {key: round(median([i[key] for i in items]), 3)
-                             for key in ('peak_g', 'x', 'y', 'z', 't_peak', 'rms_g')}
-        return row
-
-    def _save_snippet(self, number, axis, offset, repeat, lines):
-        try:
-            os.makedirs(self.raw_dir, exist_ok=True)
-            name = 'T%d_%s_%+.3f_r%d_pickup.csv' % (number, axis, offset, repeat)
-            with open(os.path.join(self.raw_dir, name), 'w') as f:
-                f.write('\n'.join(lines) + '\n')
-        except OSError:
-            logging.exception("dock_autotune: cannot write the ADXL snippet")
-
-    def _map_tool(self, gcmd, tool, axes, limits, step, repeats, raw):
-        """Map the knock of the pickup over a grid of positions: 0, +step, -step, +2 step, ... Positions beyond
-        `map_fail_stop` failed ones in a row on one side are skipped. Nothing is applied."""
-        number = tool.tool_number
-        base = {a: float(tool.params['params_park_%s' % a]) for a in axes}
-        result = self.map_rows
-        for axis in axes:
-            self._check_abort()
-            self.state['axis'] = axis
-            self.state['phase'] = 'map %s' % axis
-            steps = int(limits[axis] / step + 1e-9)
-            order = [0.0]
-            for k in range(1, steps + 1):
-                order.extend([round(k * step, 6), round(-k * step, 6)])
-            rows, fails, stopped = [], {1: 0, -1: 0}, {1: False, -1: False}
-            result[axis] = rows
-            for offset in order:
-                sign = 1 if offset > 0 else -1
-                if offset != 0 and stopped[sign]:
-                    continue
-                self._check_abort()
-                row = self._map_trial(tool, axis, offset, base[axis], repeats, raw)
-                rows.append(row)
-                self._log({'tool': number, 'axis': axis, 'map': row})
-                if offset == 0 and not row['ok']:
-                    raise AbortScan("baseline %s=%.3f does not work (tool not in its dock, or the dock must be "
-                                    "adjusted by hand first)" % (axis.upper(), base[axis]))
-                if offset != 0:
-                    fails[sign] = 0 if row['ok'] else fails[sign] + 1
-                    stopped[sign] = fails[sign] >= self.map_fail_stop
-            tool.set_parameter('params_park_%s' % axis, base[axis])
-            gcmd.respond_info('\n'.join(map_table(number, axis, rows, self.adxl_window)))
-        return base, result
-
-    # -- the seat test ----------------------------------------------------------------
+        # -- the seat test ----------------------------------------------------------------
 
     def _seat_params(self, tool, factor=1.0):
         """What the pickup_gcode uses: park position, speeds, safe and close Y, and the lift of the pickup path"""
@@ -1335,7 +1129,7 @@ class DockAutotune:
                     row = self._seat_position(tool, sp, axis, offset, repeats, slow_rel)
                     rows.append(row)
                     fails[sign] = 0 if row['ok'] else fails[sign] + 1
-                    stopped[sign] = fails[sign] >= self.map_fail_stop
+                    stopped[sign] = fails[sign] >= self.seat_fail_stop
                 gcmd.respond_info('\n'.join(seat_table(number, axis, rows, self.adxl_window)))
             if not axes:
                 self.seat_rows['z'] = [center]
@@ -1353,7 +1147,7 @@ class DockAutotune:
 
     cmd_DOCK_AUTOTUNE_help = ("Find the window in which a tool locks and centre its dock position: "
                               "DOCK_AUTOTUNE T=N [AXES=xyz] [STEP=0.1] [RANGE=MM] [REPEATS=2] "
-                              "[RESOLUTION=0.05] [SPEED=0.5] [ADXL=1] [MODE=scan|map|seat] [RAW=1] [PREPARE=0|1] "
+                              "[RESOLUTION=0.05] [SPEED=0.5] [MODE=seat|scan] [PREPARE=0|1] "
                               "[BED=70] [SOAK=SECONDS] [TOUCH=0] [DRY_RUN=1]")
 
     def _tool_numbers(self, gcmd):
@@ -1402,27 +1196,22 @@ class DockAutotune:
         label = numbers[0] if not multi else ', '.join('T%d' % n for n in numbers)
         axes = ''.join(a for a in gcmd.get('AXES', self.axes).lower() if a in AXES)
         mode = gcmd.get('MODE', self.mode).strip().lower()
-        if mode not in ('scan', 'map', 'seat'):
-            raise gcmd.error("MODE must be scan, map or seat")
+        if mode not in ('scan', 'seat'):
+            raise gcmd.error("MODE must be seat or scan")
         if mode == 'seat':
             # the height of the contact is measured at every position; only X and Y are moved
             axes = ''.join(a for a in axes if a in 'xy')
         elif not axes:
             raise gcmd.error("AXES must contain x, y or z")
-        mode_map = mode == 'map'
-        step = gcmd.get_float('STEP', {'map': self.map_step, 'seat': self.seat_step}.get(mode, self.step), above=0.)
+        step = gcmd.get_float('STEP', self.seat_step if mode == 'seat' else self.step, above=0.)
         resolution = gcmd.get_float('RESOLUTION', self.resolution, above=0.)
-        limits = {'map': {a: self.map_range for a in AXES},
-                  'seat': {a: self.seat_range for a in AXES}}.get(mode, dict(self.range))
+        limits = {a: self.seat_range for a in AXES} if mode == 'seat' else dict(self.range)
         if gcmd.get('RANGE', None) is not None:
             limits = {a: gcmd.get_float('RANGE', above=0.) for a in AXES}
         for a in AXES:
             limits[a] = gcmd.get_float('RANGE_%s' % a.upper(), limits[a], above=0.)
-        repeats = gcmd.get_int('REPEATS', {'map': self.map_repeats, 'seat': self.seat_repeats}.get(mode, self.repeats),
-                               minval=1)
+        repeats = gcmd.get_int('REPEATS', self.seat_repeats if mode == 'seat' else self.repeats, minval=1)
         speed = gcmd.get_float('SPEED', self.speed_factor, above=0., maxval=1.)
-        raw = gcmd.get_int('RAW', 1 if self.raw_default else 0) == 1
-        self.use_adxl = gcmd.get_int('ADXL', 1 if self.adxl_default else 0) == 1 or mode in ('map', 'seat')
         dry_run = gcmd.get_int('DRY_RUN', 0) == 1
         tools = []
         for number in numbers:
@@ -1430,11 +1219,8 @@ class DockAutotune:
             if tool is None:
                 raise gcmd.error("DOCK_AUTOTUNE: no tool T%d" % number)
             chip = self.accel_chip.format(tool=number)
-            if self.use_adxl and self.printer.lookup_object(chip, None) is None:
-                if mode in ('map', 'seat'):
-                    raise gcmd.error("DOCK_AUTOTUNE: MODE=%s needs the accelerometer [%s]" % (mode, chip))
-                gcmd.respond_info("dock_autotune: ADXL=1 but there is no [%s] section - scanning without the "
-                                  "accelerometer" % chip)
+            if mode == 'seat' and self.printer.lookup_object(chip, None) is None:
+                raise gcmd.error("DOCK_AUTOTUNE: MODE=seat needs the accelerometer [%s] (MODE=scan does not)" % chip)
             tools.append(tool)
         self._check_not_printing(gcmd)
 
@@ -1482,13 +1268,10 @@ class DockAutotune:
                                      repeats, 1 + positions * repeats, positions,
                                      *[float(tool.params['params_park_%s' % a]) for a in 'xyz']))
             else:
-                if mode == 'map':
-                    trials = sum(2 * n + 1 for n in per_axis.values())
-                else:
-                    trials = sum(2 * n + 2 * bisect + 2 for n in per_axis.values())
-                gcmd.respond_info("dock_autotune T%d %s, axes %s, step %.3f mm, range %s, %d repeat(s): about %d "
+                trials = sum(2 * n + 2 * bisect + 2 for n in per_axis.values())
+                gcmd.respond_info("dock_autotune T%d scan, axes %s, step %.3f mm, range %s, %d repeat(s): about %d "
                                   "trials (%d pickups) at most, current dock position x=%.3f y=%.3f z=%.3f"
-                                  % (number, 'ADXL map' if mode == 'map' else 'scan', axes.upper(), step,
+                                  % (number, axes.upper(), step,
                                      ' '.join('%s+/-%.2f' % (a, limits[a]) for a in axes),
                                      repeats, trials, trials * repeats,
                                      *[float(tool.params['params_park_%s' % a]) for a in 'xyz']))
@@ -1536,13 +1319,12 @@ class DockAutotune:
                 settings = ['step %.3f mm' % step, 'range ' + ' '.join('%s+/-%.2f' % (a, limits[a]) for a in axes),
                             '%d repeat(s)' % repeats, 'speed factor %g' % speed,
                             'acceleration %g' % min(self.accel, saved_accel)]
-                if mode in ('map', 'seat'):
-                    settings.append('high-pass %d ms' % int(round(self.adxl_window * 1000)))
                 if mode == 'seat':
+                    settings.append('high-pass %d ms' % int(round(self.adxl_window * 1000)))
                     settings.append('speed at the contact %g mm/s' % self.seat_speed)
                 settings.append('machine prepared by DOCK_AUTOTUNE with bed %g C' % bed if prepare
                                 else 'machine was prepared before')
-                run = self._run_tool(gcmd, tool, mode, axes, limits, step, repeats, resolution, raw, speed, settings,
+                run = self._run_tool(gcmd, tool, mode, axes, limits, step, repeats, resolution, speed, settings,
                                      check=prepare or index > 0, runs=runs, save=not multi)
                 if run['status'] != 'finished':
                     break
@@ -1569,9 +1351,9 @@ class DockAutotune:
             self.active = False
             self.state['phase'] = 'idle'
 
-    def _run_tool(self, gcmd, tool, mode, axes, limits, step, repeats, resolution, raw, speed, settings, check,
+    def _run_tool(self, gcmd, tool, mode, axes, limits, step, repeats, resolution, speed, settings, check,
                   runs, save):
-        """The measurement of one tool (scan, map or seat test) with the park values and the path speed put back
+        """The measurement of one tool (seat test or scan) with the park values and the path speed put back
         afterwards. Appends its run (number, status, info, result) to `runs`; an AbortScan ends this tool only."""
         number = tool.tool_number
         interrupted = self.abort        # an interrupt between two tools is not forgotten
@@ -1590,13 +1372,7 @@ class DockAutotune:
             if self._tc_status()['tool_number'] == number:
                 self._run("UNSELECT_TOOL %s" % RESTORE_NONE)
                 self._wait()
-            if mode == 'map':
-                base, result = self._map_tool(gcmd, tool, axes, limits, step, repeats, raw)
-                self.result = {'tool': number, 'map': result}
-                gcmd.respond_info("dock_autotune T%d ADXL map finished after %d pickups, the park values are "
-                                  "unchanged%s" % (number, self.cycles,
-                                                   ", CSV snippets in %s" % self.raw_dir if raw else ""))
-            elif mode == 'seat':
+            if mode == 'seat':
                 self._seat_tool(gcmd, tool, axes, limits, step, repeats)
                 self.result = {'tool': number, 'seat': self.seat_rows}
                 gcmd.respond_info("dock_autotune T%d seat test finished after %d lifts, the park values are "
@@ -1614,8 +1390,7 @@ class DockAutotune:
             status = 'STOPPED: %s' % e
             raise
         finally:
-            info = self._report_info(number, mode, status, originals, proposals, settings,
-                                     self.raw_dir if raw and mode == 'map' else None)
+            info = self._report_info(number, mode, status, originals, proposals, settings)
             run.update(status=status, info=info, result=self.result)
             if save and info:
                 path = self._save_report('T%d_%s_%s.txt' % (number, mode, time.strftime('%Y%m%d_%H%M%S')),
@@ -1631,15 +1406,15 @@ class DockAutotune:
             tool.set_parameter('params_path_speed', saved_speed)
         return run
 
-    def _report_info(self, number, mode, status, originals, proposals, settings, raw_dir):
+    def _report_info(self, number, mode, status, originals, proposals, settings):
         """What the result file of one tool is made of, None if nothing was measured"""
         seat = self.seat_info if (self.seat_rows or self.seat_info.get('coarse')) else None
-        if not (self.trial_rows or any(self.map_rows.values()) or seat):
+        if not (self.trial_rows or seat):
             return None
         return {'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'tool': number, 'mode': mode, 'status': status,
                 'pickups': self.cycles, 'settings': settings, 'originals': originals, 'new': proposals,
-                'scan': self.scan_result, 'trials': self.trial_rows, 'map': self.map_rows, 'seat': seat,
-                'window': self.adxl_window, 'raw_dir': raw_dir}
+                'scan': self.scan_result, 'trials': self.trial_rows, 'seat': seat,
+                'window': self.adxl_window}
 
     def _save_report(self, name, render):
         """Writes the text that render() makes to results_dir, returns the path (None: no folder or not writable)"""
@@ -1700,7 +1475,7 @@ class DockAutotune:
         self.abort = False
         self.cycles = 0
         self.result = {}
-        self.trial_rows, self.map_rows, self.scan_result = [], {}, {}
+        self.trial_rows, self.scan_result = [], {}
         self.seat_rows, self.seat_info = {}, {}
         self.state.update({'tool': number, 'axis': None, 'phase': 'start', 'trial': 0, 'message': ''})
 

@@ -398,7 +398,7 @@ class SeatCommandTests(unittest.TestCase):
     def test_positions_where_the_tool_is_not_detected_end_a_side(self):
         # the tool detection is off from an error of 1.15 mm on, and the dock is 0.2 mm off: +1.5 and +2.0 fail, so
         # +2.5 and +3.0 are skipped; on the other side -1.0 and -1.5 fail, so -2.0 and further are skipped
-        self.make(map_fail_stop='2')
+        self.make(seat_fail_stop='2')
         self.seat(T=2, AXES='x', RANGE=3.0, STEP=0.5, REPEATS=1)
         rows = self.module.seat_info['rows']['x']
         offsets = sorted(r['offset'] for r in rows)
@@ -450,6 +450,7 @@ class SeatCommandTests(unittest.TestCase):
         gcmd = self.seat(T=2, AXES='x', RANGE=1.0, STEP=0.25, REPEATS=1)
         self.assertIn('STOPPED', gcmd.text)
         self.assertEqual(self.rig.pos[1], 100.0)
+        self.assertIn('Status: STOPPED: stopped by DOCK_AUTOTUNE_INTERRUPT', self.report()[1])
 
     def test_dry_run_shows_the_moves(self):
         self.make()

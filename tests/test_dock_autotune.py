@@ -7,9 +7,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, 'klipper', 'extras'))
 
 import dock_autotune  # noqa: E402
-from dock_autotune import (build_plan, build_prompt, command_line, csv_snippet, detect_setup,  # noqa: E402
-                           knock_metrics, map_table, median, scan_axis, shock_metrics, window_center,
-                           zero_crossings)
+from dock_autotune import (build_plan, build_prompt, command_line, detect_setup,  # noqa: E402
+                           knock_metrics, median, scan_axis, window_center)
 
 
 # --- pure helpers ----------------------------------------------------------
@@ -70,34 +69,6 @@ class ScanAxisTests(unittest.TestCase):
         self.assertEqual(window_center(edges), 0.0)
 
 
-class ShockMetricsTests(unittest.TestCase):
-    G = dock_autotune.FREEFALL
-
-    def samples(self, values):
-        return [(i * 0.001, 0.0, 0.0, v * self.G) for i, v in enumerate(values)]
-
-    def test_too_few_samples(self):
-        self.assertIsNone(shock_metrics([]))
-        self.assertIsNone(shock_metrics(self.samples([1, 1])))
-
-    def test_constant_gravity_is_no_shock(self):
-        m = shock_metrics(self.samples([1.0] * 50))
-        self.assertEqual((m['peak_dev_g'], m['peak_delta_g'], m['rms_g']), (0.0, 0.0, 0.0))
-
-    def test_knock(self):
-        values = [1.0] * 20 + [4.0] + [1.0] * 20
-        m = shock_metrics(self.samples(values))
-        self.assertEqual(m['peak_dev_g'], 3.0)
-        self.assertEqual(m['peak_delta_g'], 3.0)
-        self.assertGreater(m['rms_g'], 0.0)
-
-    def test_tilt_is_not_a_knock(self):
-        # slow change of the orientation: large deviation, but small steps between samples
-        m = shock_metrics(self.samples([1.0 + 0.01 * i for i in range(100)]))
-        self.assertLess(m['peak_delta_g'], 0.02)
-        self.assertGreater(m['peak_dev_g'], 0.4)
-
-
 # --- ADXL map (pure) -----------------------------------------------------------------
 
 G = dock_autotune.FREEFALL
@@ -119,8 +90,9 @@ class KnockMetricsTests(unittest.TestCase):
     def test_a_g_is_9806_65_mm_per_s2(self):
         # Klipper reports mm/s^2: 1 g is 9806.65, not 9.80665
         self.assertAlmostEqual(G, 9806.65)
-        metrics = shock_metrics([(i * 0.001, 0.0, 0.0, -G * (1 + (i == 30))) for i in range(60)])
-        self.assertAlmostEqual(metrics['peak_dev_g'], 1.0, places=2)
+        metrics = knock_metrics([(i * 0.001, 0.0, 0.0, -G * (1 + (i == 30))) for i in range(60)], 0.0, 1.0)
+        self.assertGreater(metrics['peak_g'], 0.9)
+        self.assertLess(metrics['peak_g'], 1.01)
 
     def test_gravity_and_slow_motion_are_not_a_knock(self):
         metrics = knock_metrics(gravity_samples(ramp=0.2), 0.0, 2.0)
@@ -148,50 +120,11 @@ class KnockMetricsTests(unittest.TestCase):
 
     def test_too_few_samples(self):
         self.assertIsNone(knock_metrics(gravity_samples(seconds=0.01), 0.0, 1.0))
-        self.assertEqual(csv_snippet(gravity_samples(seconds=0.01), 0.0, 1.0, 0.0), [])
-
-    def test_csv_snippet_is_a_window_around_the_peak(self):
-        samples = gravity_samples(knock_at=1.0, knock=(0.0, 0.0, 0.5))
-        lines = csv_snippet(samples, 0.0, 2.0, 1.0, half=0.1)
-        self.assertEqual(lines[0], 'time_s,x_g,y_g,z_g,res_x_g,res_y_g,res_z_g')
-        times = [float(l.split(',')[0]) for l in lines[1:]]
-        self.assertAlmostEqual(min(times), 0.9, places=2)
-        self.assertAlmostEqual(max(times), 1.1, places=2)
-        self.assertAlmostEqual(float(lines[1].split(',')[3]), -1.0, places=3)
 
     def test_median(self):
         self.assertEqual(median([3, 1, 2]), 2)
         self.assertEqual(median([1, 2, 3, 4]), 2.5)
         self.assertIsNone(median([]))
-
-
-def map_row(offset, ok=True, z=0.0, x=0.0, peak=0.2):
-    return {'offset': offset, 'value': 266.2 + offset, 'locked': 3 if ok else 0, 'total': 3, 'ok': ok,
-            'pick': {'peak_g': peak, 'x': x, 'y': 0.0, 'z': z, 't_peak': 0.4, 'rms_g': 0.01} if ok else None,
-            'drop': {'peak_g': 0.1} if ok else None}
-
-
-class MapTableTests(unittest.TestCase):
-    def test_zero_crossing_is_interpolated(self):
-        rows = [map_row(-0.5, z=-0.4), map_row(0.0, z=-0.1), map_row(0.25, z=0.15), map_row(0.5, z=0.4)]
-        self.assertEqual(zero_crossings(rows, 'z'), [0.1])
-        self.assertEqual(zero_crossings(rows, 'x'), [])
-
-    def test_failed_positions_are_left_out_of_the_crossings(self):
-        rows = [map_row(-0.5, ok=False), map_row(0.0, z=-0.1), map_row(0.25, z=0.1)]
-        self.assertEqual(zero_crossings(rows, 'z'), [0.125])
-
-    def test_table(self):
-        rows = [map_row(0.25, z=0.15, peak=0.3), map_row(-0.25, z=-0.1, peak=0.1), map_row(0.5, ok=False)]
-        text = '\n'.join(map_table(0, 'z', rows, 0.05))
-        self.assertIn('ADXL map T0 Z', text)
-        self.assertIn('50 ms high-pass', text)
-        self.assertLess(text.index('-0.25'), text.index('+0.25'))        # sorted by offset
-        self.assertIn('3/3', text)
-        self.assertIn('0/3', text)
-        self.assertIn('Quietest pickup: -0.25 mm (0.100 g)', text)
-        self.assertIn('Component z changes sign at -0.05 mm', text)
-        self.assertIn('Nothing is changed by a map', text)
 
 
 # --- detection, plan, prompt (pure) ------------------------------------------------
@@ -459,57 +392,6 @@ class FakePrintStats:
 
     def get_status(self, eventtime):
         return {'state': self.state}
-
-
-class FakeChip:
-    """ADXL: every client gets a quiet signal with an optional knock"""
-
-    def __init__(self, knock_g=0.0):
-        self.knock_g = knock_g
-
-    def start_internal_client(self):
-        chip = self
-
-        class Client:
-            def finish_measurements(self):
-                pass
-
-            def get_samples(self):
-                g = dock_autotune.FREEFALL
-                values = [g] * 30 + [g * (1 + chip.knock_g)] + [g] * 30
-                return [(i * 0.001, 0.0, 0.0, v) for i, v in enumerate(values)]
-        return Client()
-
-
-class MapChip:
-    """ADXL of a tool: -1 g on z, at 0.25 s after the start of a cycle the pickup knocks with a strength that
-    depends on how far the park values are from the true position, at 0.75 s a small knock of the dropoff"""
-
-    def __init__(self, dock, toolhead, gain=(1.0, 1.0, 2.0)):
-        self.dock, self.toolhead, self.gain = dock, toolhead, gain
-
-    def start_internal_client(self):
-        chip, start = self, self.toolhead.clock
-
-        class Client:
-            def finish_measurements(self):
-                pass
-
-            def get_samples(self):
-                end = chip.toolhead.clock
-                knock = [chip.gain[i] * (chip.dock.tool.params['params_park_' + a] - chip.dock.truth[a])
-                         for i, a in enumerate('xyz')]
-                out = []
-                for i in range(int((end - start) * 1000) + 1):
-                    t = i / 1000.0
-                    x, y, z = 0.0, 0.0, -1.0
-                    if abs(t - 0.25) < 0.0005:
-                        x, y, z = x + knock[0], y + knock[1], z + knock[2]
-                    if abs(t - 0.75) < 0.0005:
-                        z += 0.1
-                    out.append((start + t, x * G, y * G, z * G))
-                return out
-        return Client()
 
 
 class FakePrinter:
@@ -786,22 +668,6 @@ class CommandTests(unittest.TestCase):
         self.assertGreater(len(lines), 3)
         self.assertIn('"summary"', lines[-1])
 
-    def test_accelerometer_is_recorded_and_can_stop_the_scan(self):
-        self.make(chip=FakeChip(knock_g=2.0), abort_g='5')
-        self.scan(T=2, AXES='x', RANGE=0.3, ADXL=1)
-        with open(self.module.log_file) as f:
-            self.assertIn('"peak_g": 2.0', f.read())
-        self.make(chip=FakeChip(knock_g=8.0), abort_g='5')
-        gcmd = self.scan(T=2, AXES='x', RANGE=0.3, ADXL=1)
-        self.assertIn('above abort_g', gcmd.text)
-        self.assertEqual(self.dock.pickups, 1)
-
-    def test_missing_accelerometer_does_not_stop_the_scan(self):
-        self.make()
-        gcmd = self.scan(T=2, AXES='x', RANGE=0.3, ADXL=1)
-        self.assertNotIn('STOPPED', gcmd.text)
-        self.assertIn('there is no [adxl345 T2] section', gcmd.text)
-
     def test_old_error_handler_that_pauses_stops_the_scan(self):
         self.make(hidden=(0.0, 0.0, 0.0), window={'x': (-0.15, 0.15), 'y': WINDOW['y'], 'z': WINDOW['z']})
 
@@ -816,89 +682,11 @@ class CommandTests(unittest.TestCase):
 
     # -- ADXL map ----------------------------------------------------------------------------
 
-    def make_map(self, **kw):
-        self.make(**kw)
-        self.printer.objects['adxl345 T2'] = MapChip(self.dock, self.printer.objects['toolhead'])
-
-    def test_map_shows_the_knock_over_the_positions_and_changes_nothing(self):
-        self.make_map(window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-1.0, 1.0)})
-        gcmd = self.scan(T=2, MODE='map', AXES='z', RANGE=0.5, STEP=0.25, REPEATS=1)
-        self.assertIn('ADXL map T2 Z', gcmd.text)
-        self.assertIn('ADXL map finished after 5 pickups, the park values are unchanged', gcmd.text)
-        # the true position of z is 0.1 above the start: the z component changes sign there
-        self.assertIn('Component z changes sign at +0.10 mm', gcmd.text)
-        self.assertIn('Quietest pickup: +0.00 mm', gcmd.text)
-        self.assertEqual(self.tool.params['params_park_z'], 266.2)
-        self.assertEqual(self.dock.pickups, 5)
-
-    def test_map_order_and_repeats(self):
-        self.make_map(window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-1.0, 1.0)})
-        seen = []
-        real = self.tool.set_parameter
-
-        def spy(name, value):
-            if name == 'params_park_z':
-                seen.append(round(value - 266.2, 3))
-            return real(name, value)
-        self.tool.set_parameter = spy
-        self.scan(T=2, MODE='map', AXES='z', RANGE=0.5, STEP=0.25, REPEATS=2)
-        self.assertEqual(seen[:6], [0.0, 0.25, -0.25, 0.5, -0.5, 0.0])        # the last one is the restore
-        self.assertEqual(self.dock.pickups, 10)
-
-    def test_map_stops_a_side_after_failures_in_a_row(self):
-        # the window ends 0.3 above and 0.4 below the start: +0.5, +0.75, +1.0 fail, and from the second one on the
-        # side is skipped
-        self.make_map(window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-0.5, 0.2)}, map_fail_stop='2')
-        gcmd = self.scan(T=2, MODE='map', AXES='z', RANGE=1.5, STEP=0.25, REPEATS=1)
-        offsets = [float(line.split()[0]) for line in gcmd.text.splitlines() if line[:1] in ' +-' and '/' in line]
-        self.assertIn(0.25, offsets)
-        self.assertIn(0.5, offsets)
-        self.assertNotIn(1.0, offsets)          # skipped after 0.5 and 0.75 failed
-        self.assertIn(-0.25, offsets)
-        self.assertIn('0/1', gcmd.text)
-
-    def test_map_needs_the_accelerometer(self):
-        self.make()
-        with self.assertRaises(CommandError) as ctx:
-            self.scan(T=2, MODE='map', AXES='z')
-        self.assertIn('MODE=map needs the accelerometer [adxl345 T2]', str(ctx.exception))
-        self.assertEqual(self.dock.scripts, [])
-
     def test_unknown_mode(self):
-        self.make_map()
-        with self.assertRaises(CommandError):
-            self.scan(T=2, MODE='nonsense')
-
-    def test_map_with_a_failing_baseline_stops(self):
-        self.make_map(hidden=(0.0, 0.0, 1.5))
-        gcmd = self.scan(T=2, MODE='map', AXES='z', RANGE=0.5, STEP=0.25, REPEATS=1)
-        self.assertIn('STOPPED', gcmd.text)
-        self.assertIn('baseline Z', gcmd.text)
-        self.assertEqual(self.tool.params['params_park_z'], 266.2)
-
-    def test_raw_snippets_are_written(self):
-        self.make_map(window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-1.0, 1.0)})
-        self.scan(T=2, MODE='map', AXES='z', RANGE=0.25, STEP=0.25, REPEATS=1, RAW=1)
-        folder = os.path.join(os.path.dirname(self.module.log_file), 'dock_autotune_adxl')
-        files = sorted(os.listdir(folder))
-        self.assertEqual(files, ['T2_z_+0.000_r1_pickup.csv', 'T2_z_+0.250_r1_pickup.csv', 'T2_z_-0.250_r1_pickup.csv'])
-        with open(os.path.join(folder, files[0])) as f:
-            self.assertTrue(f.readline().startswith('time_s,x_g'))
-
-    def test_map_rows_go_to_the_log(self):
-        self.make_map(window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-1.0, 1.0)})
-        self.scan(T=2, MODE='map', AXES='z', RANGE=0.25, STEP=0.25, REPEATS=1)
-        with open(self.module.log_file) as f:
-            text = f.read()
-        self.assertEqual(text.count('"map"'), 3)
-        self.assertIn('"peak_g"', text)
-
-    def test_dry_run_of_a_map(self):
-        self.make_map()
-        gcmd = self.scan(T=2, MODE='map', AXES='z', DRY_RUN=1)
-        self.assertIn('ADXL map', gcmd.text)
-        self.assertIn('nothing moved', gcmd.text)
-        self.assertEqual(self.dock.scripts, [])
+        self.make()
+        for mode in ('nonsense', 'map'):
+            with self.assertRaises(CommandError):
+                self.scan(T=2, MODE=mode)
 
     # -- several tools in one run -------------------------------------------------------------
 
@@ -1125,20 +913,6 @@ class CommandTests(unittest.TestCase):
         with open(os.path.join(self.module.results_dir, files[0])) as f:
             return files[0], f.read()
 
-    def test_config_defaults_replace_the_parameters(self):
-        self.make_map(window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-1.0, 1.0)},
-                      mode='map', axes='z', map_range='0.5', map_step='0.25', map_repeats='1', adxl_raw='True')
-        gcmd = self.scan(T=2)
-        self.assertIn('ADXL map T2 Z', gcmd.text)
-        self.assertEqual(self.dock.pickups, 5)
-        self.assertEqual(self.tool.params['params_park_x'], 149.6)
-        self.assertTrue(os.listdir(self.module.raw_dir))
-        # a parameter of the call wins
-        self.make(mode='map', axes='z')
-        gcmd = self.scan(T=2, MODE='scan', AXES='x', RANGE=0.3)
-        self.assertIn('axis X', gcmd.text)
-        self.assertNotIn('ADXL map', gcmd.text)
-
     def test_wrong_option_values(self):
         for options in ({'mode': 'both'}, {'prepare': 'maybe'}):
             with self.assertRaises(Exception):
@@ -1164,7 +938,7 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn('params_park_x', text.split('Scan trials')[0].split('Put these lines')[-1])
         self.assertIn('Scan trials Z', text)
         self.assertIn('FAILED', text)
-        self.assertIn('tool,axis,offset_mm,value_mm,locked,peak_g', text)
+        self.assertIn('tool,axis,offset_mm,value_mm,locked\n', text)
 
     def test_scan_report_with_a_window_that_is_not_closed(self):
         self.make(hidden=(0.0, 0.0, 0.0), window={'x': (-5, 5), 'y': (-5, 5), 'z': (-5, 5)})
@@ -1172,36 +946,6 @@ class CommandTests(unittest.TestCase):
         text = self.report()[1]
         self.assertIn('No park position was changed.', text)
         self.assertIn('window not closed', text)
-
-    def test_map_report_has_the_measurements_and_the_unchanged_positions(self):
-        self.make_map(window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-1.0, 1.0)})
-        self.scan(T=2, MODE='map', AXES='z', RANGE=0.5, STEP=0.25, REPEATS=1)
-        name, text = self.report()
-        self.assertTrue(name.startswith('T2_map_'))
-        self.assertIn('ADXL map T2 Z', text)
-        self.assertIn('measured, not changed by a map', text)
-        self.assertIn('No park position was changed.', text)
-        self.assertIn('Component z changes sign at +0.10 mm', text)
-        csv = text.split('Data (CSV)')[1].strip().splitlines()
-        self.assertTrue(csv[0].startswith('tool,axis,offset_mm,value_mm,locked,total,pick_peak_g'))
-        self.assertEqual(len(csv), 1 + 5)
-        self.assertTrue(csv[1].startswith('2,z,-0.5,'))
-
-    def test_report_of_a_stopped_run(self):
-        self.make_map(hidden=(0.0, 0.0, 0.0), window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-1.0, 1.0)})
-        calls = []
-        real = self.module._map_trial
-
-        def stop_after_two(*a, **kw):
-            calls.append(1)
-            if len(calls) == 3:
-                self.module.abort = True
-            return real(*a, **kw)
-        self.module._map_trial = stop_after_two
-        self.scan(T=2, MODE='map', AXES='z', RANGE=1.0, STEP=0.25, REPEATS=1)
-        text = self.report()[1]
-        self.assertIn('Status: STOPPED: stopped by DOCK_AUTOTUNE_INTERRUPT', text)
-        self.assertEqual(len(text.split('Data (CSV)')[1].strip().splitlines()), 1 + 2)    # the third was stopped
 
     def test_no_result_file_without_a_folder_or_without_data(self):
         self.make(results_dir='')
