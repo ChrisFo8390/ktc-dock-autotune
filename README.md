@@ -152,18 +152,23 @@ against the known move of the shuttle, so their height comes out in mm (about 0.
 then `seat_step` (0.25 mm) steps along X and along Y up to `seat_range` (1 mm) to both sides, `seat_repeats` (3) lifts
 each. A side ends after `seat_fail_stop` positions in a row where the tool detection was off at the top.
 
-**Result, per position** (medians over the repeats): the pin at the top, the number of knocks, the height of the first
-and the last knock, their strength, the **lateral share** (part of the knock energy in x and y) and the **net velocity
-change in x and y** with its sign, and the knock while the shuttle goes down.
+**Result, per position** (medians over the repeats): the pin at the top, the number of knocks, the height and strength
+of the strongest knock, the **energy of the whole lift** (every knock, also the small ones), the lateral share of the
+knock energy, the net velocity change in x and y, and the knock while the shuttle goes down (`release`, about 1 g is the
+noise floor).
 
-* **Z:** the last knock is the seating. The path continues up to the `verify` waypoint, so the distance between the two
-  is how far the path pushes beyond the contact. Set `params_park_z` so that this distance is what you want.
-* **XY:** a tool that is guided sideways shows a lateral share and a sign. Where the lateral share is smallest and the
-  sign changes, the pins find their holes without being pushed. Whether this gives a clean answer on your machine has to
-  be looked at in the first maps; the module only reports, it applies nothing.
+* **Quiet window (the suggestion).** A lift where the pins find their holes without being pushed is calm; a lift that
+  needs a sideways shove or snaps the tool into place is loud and can be heard. For X and for Y the module takes the
+  positions whose energy is in the lowest quarter between the lowest and the highest, looks for a run of them with a
+  louder position on **both** sides, and suggests its centre as the new `params_park_x/y` together with a ready
+  `SET_TOOL_PARAMETER` line. Nothing is applied: try the value, then run the seat test again around it and check that the
+  position is quiet and the window is centred. If the quiet range reaches the end of the measured range the window is
+  *not closed* and no value is suggested (raise `seat_range`); if all positions are alike the message says so.
+* **Z:** the strongest knock is where shuttle and tool touch or snap. The path continues up to the `verify` waypoint, so
+  the distance between the two is how far the path goes on; the result file shows both.
 
 If the slow lifts show no events, the knocks are below the threshold (6 times the noise, at least 0.5 g): lower
-`seat_threshold` or raise `seat_speed`.
+`seat_threshold` or raise `seat_speed`. The energy and the quiet window do not depend on that threshold.
 
 ## Scan
 

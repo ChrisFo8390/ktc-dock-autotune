@@ -150,6 +150,9 @@ def _park_result(axis, info):
     if info['mode'] == 'seat':
         if axis == 'z':
             return before, 'height of the contact measured, not changed by the seat test'
+        proposal = (info.get('seat') or {}).get('proposals', {}).get(axis)
+        if proposal and proposal['value'] is not None:
+            return before, 'not changed, the quiet window suggests %.3f' % proposal['value']
         return before, ('measured, not changed by the seat test' if axis in info.get('seat', {}).get('rows', {})
                         else 'not measured')
     if info.get('new', {}).get(axis) is not None:
@@ -191,6 +194,10 @@ def build_report(info):
     if info.get('seat'):
         lines.append("")
         lines.extend(seat_summary(info['seat']))
+        suggestions = seat_suggestions(info['seat'], tool)
+        if suggestions:
+            lines.append("")
+            lines.extend(suggestions)
         for axis in AXES:
             if info['seat']['rows'].get(axis):
                 lines.append("")
@@ -205,13 +212,14 @@ def build_report(info):
                 lines.append("%+7.3f  %9.3f  %s" % (t['value'] - start, t['value'], 'locked' if t['ok'] else 'FAILED'))
     lines.extend(["", "Data (CSV)"])
     if info['mode'] == 'seat':
-        lines.append("tool,axis,offset_mm,value_mm,pin_ok,pin_total,events,z_first,z_last,peak_first_g,peak_last_g,"
-                     "lateral_share,ix_mm_s,iy_mm_s,release_g")
+        lines.append("tool,axis,offset_mm,value_mm,pin_ok,pin_total,events,z_main,peak_all_g,energy_g2s,z_first,z_last,"
+                     "peak_first_g,peak_last_g,lateral_share,ix_mm_s,iy_mm_s,release_g")
         for axis in AXES:
             for r in sorted(info.get('seat', {}).get('rows', {}).get(axis, []), key=lambda r: r['offset']):
                 lines.append(','.join('' if v is None else str(v) for v in (
-                    tool, axis, r['offset'], r['value'], r['pin'], r['total'], r['events'], r['z_first'],
-                    r['z_last'], r['peak_first'], r['peak_last'], r['lateral'], r['ix'], r['iy'], r['release_g'])))
+                    tool, axis, r['offset'], r['value'], r['pin'], r['total'], r['events'], r.get('z_main'),
+                    r.get('peak_all'), r.get('energy'), r['z_first'], r['z_last'], r['peak_first'], r['peak_last'],
+                    r['lateral'], r['ix'], r['iy'], r['release_g'])))
     else:
         lines.append("tool,axis,offset_mm,value_mm,locked")
         for t in info.get('trials', []):
@@ -280,6 +288,18 @@ def build_multi_report(runs, numbers, mode, when):
             lines.extend("    " + c for c in changed[n])
     else:
         lines.append("No park position was changed.")
+    suggested = [(r['number'], r['info']['seat']) for r in runs
+                 if r.get('info') and r['info'].get('seat') and r['info']['seat'].get('proposals')]
+    if suggested:
+        lines.extend(["", "Suggested by the quiet windows of the seat test (nothing is applied, run the seat test again "
+                          "around a new position):"])
+        for n, seat in suggested:
+            for axis in 'xy':
+                p = seat['proposals'].get(axis)
+                if p and p['value'] is not None:
+                    lines.append("  T%d params_park_%s: %.3f   (%s)" % (n, axis, p['value'], p['text']))
+                elif p:
+                    lines.append("  T%d %s: %s" % (n, axis, p['text']))
     for r in runs:
         if r.get('info'):
             lines.extend(["", "=" * 78, ""] + build_report(r['info']).rstrip('\n').splitlines())
@@ -397,13 +417,14 @@ def find_events(samples, t_from, t_to, t_quiet, window=0.05, threshold=0.0, gap=
 
 def seat_row(offset, value, hubs):
     """One position of the seat test: medians over its lifts. hubs: pin (seen at the top), events (z, rel, peak_g,
-    e_x, e_y, e_z, i_x, i_y), release_g"""
+    e_x, e_y, e_z, i_x, i_y), release_g, energy_g2s and lift_peak_g (of the whole lift, also below the threshold)"""
     def med(values, digits=3):
         values = [v for v in values if v is not None]
         return round(median(values), digits) if values else None
 
     firsts = [min(h['events'], key=lambda e: e['z']) for h in hubs if h['events']]
     lasts = [max(h['events'], key=lambda e: e['z']) for h in hubs if h['events']]
+    mains = [max(h['events'], key=lambda e: e['peak_g']) for h in hubs if h['events']]
     shares = []
     for h in hubs:
         lateral = sum(e['e_x'] + e['e_y'] for e in h['events'])
@@ -414,7 +435,9 @@ def seat_row(offset, value, hubs):
             'total': len(hubs), 'ok': all(h['pin'] for h in hubs),
             'events': med([len(h['events']) for h in hubs], 1),
             'z_first': med([e['z'] for e in firsts]), 'z_last': med([e['z'] for e in lasts]),
+            'z_main': med([e['z'] for e in mains]), 'peak_main': med([e['peak_g'] for e in mains]),
             'peak_first': med([e['peak_g'] for e in firsts]), 'peak_last': med([e['peak_g'] for e in lasts]),
+            'energy': med([h.get('energy_g2s') for h in hubs], 4), 'peak_all': med([h.get('lift_peak_g') for h in hubs]),
             'lateral': med(shares),
             'ix': med([sum(e['i_x'] for e in h['events']) for h in hubs if h['events']], 2),
             'iy': med([sum(e['i_y'] for e in h['events']) for h in hubs if h['events']], 2),
@@ -428,53 +451,115 @@ def seat_crossings(rows, key):
             for (o1, v1), (o2, v2) in zip(points, points[1:]) if v1 * v2 < 0]
 
 
+def seat_proposal(axis, rows, quiet_part=0.25):
+    """
+    The quiet window along one axis: the positions where the lift is clearly calmer than at the others. The measure
+    is the energy of the whole lift (every knock, also the small ones). A position is quiet if its energy is in the
+    lowest quarter between the lowest and the highest one. The window is a run of quiet positions with a louder one on
+    both sides; its centre is suggested. Returns state (ok, open, flat, no data), offset and value of the centre,
+    the edges, and a text.
+    """
+    points = sorted((r['offset'], r['energy'], r['value']) for r in rows if r.get('energy') is not None)
+    if len(points) < 4:
+        return {'state': 'no data', 'text': 'too few positions measured', 'value': None}
+    energies = [e for _, e, _ in points]
+    low, high = min(energies), max(energies)
+    if high < 2.0 * low:
+        return {'state': 'flat', 'value': None,
+                'text': 'no clear difference between the positions (energy %.3f .. %.3f)' % (low, high)}
+    level = low + quiet_part * (high - low)
+    runs, start = [], None
+    for i, (_, e, _) in enumerate(points + [(0, high + 1, 0)]):
+        if e <= level and start is None:
+            start = i
+        elif e > level and start is not None:
+            runs.append((start, i - 1))
+            start = None
+    park = median([v - o for o, _, v in points])
+
+    def edge(i, j):
+        return (points[i][0] + points[j][0]) / 2.0
+
+    closed = [(a, b) for a, b in runs if a > 0 and b < len(points) - 1]
+    if closed:
+        a, b = max(closed, key=lambda run: (points[run[1]][0] - points[run[0]][0], -sum(points[k][1] for k in range(run[0], run[1] + 1))))
+        minus, plus = edge(a - 1, a), edge(b, b + 1)
+        centre = (minus + plus) / 2.0
+        return {'state': 'ok', 'offset': round(centre, 3), 'value': round(park + centre, 3), 'minus': round(minus, 3),
+                'plus': round(plus, 3), 'text': 'quiet from %+.2f to %+.2f mm around the park position (%.2f mm wide), '
+                                                 'centre %+.2f mm' % (minus, plus, plus - minus, centre)}
+    a, b = max(runs, key=lambda run: points[run[1]][0] - points[run[0]][0])
+    sides = []
+    if a == 0:
+        sides.append('minus')
+    if b == len(points) - 1:
+        sides.append('plus')
+    return {'state': 'open', 'value': None, 'minus': points[a][0], 'plus': points[b][0],
+            'text': 'quiet from %+.2f to %+.2f mm but no louder position on the %s side within the range: raise '
+                    'seat_range' % (points[a][0], points[b][0], ' and '.join(sides))}
+
+
+def seat_suggestions(seat, tool):
+    """Lines with the park positions that the quiet windows suggest, and how to try them (nothing is applied)"""
+    proposals = seat.get('proposals') or {}
+    lines = []
+    for axis in 'xy':
+        p = proposals.get(axis)
+        if p:
+            lines.append("  %s: %s%s" % (axis, p['text'], ('  ->  params_park_%s: %.3f' % (axis, p['value']))
+                                         if p['value'] is not None else ''))
+    ok = [a for a in 'xy' if proposals.get(a) and proposals[a]['value'] is not None]
+    if not lines:
+        return []
+    out = ["Suggested park positions (nothing is applied). The quiet window is the range of positions without a "
+           "clear knock:"] + lines
+    if ok:
+        out.append("To try them without editing the tool file, then run the seat test again around the new position:")
+        out.extend("  SET_TOOL_PARAMETER T=%d PARAMETER=params_park_%s VALUE=%.3f" % (tool, a, proposals[a]['value'])
+                   for a in ok)
+    return out
+
+
 def seat_summary(seat):
     """Lines about the height of the lift: where it knocks, how far below the verify waypoint"""
     rows = [r for axis in AXES for r in seat['rows'].get(axis, [])]
-    firsts = [r['z_first'] for r in rows if r['z_first'] is not None]
-    lasts = [r['z_last'] for r in rows if r['z_last'] is not None]
+    mains = [r['z_main'] for r in rows if r.get('z_main') is not None]
     top = seat['verify_z']
     lines = ["Lift into the shuttle: park Z %.3f, verify waypoint at Z %.3f" % (seat['park_z'], top)]
-    if lasts:
-        lines.append("  first knock at Z %.3f (%.3f mm below the verify waypoint), spread over the positions "
-                     "%.3f mm" % (median(firsts), top - median(firsts), max(firsts) - min(firsts)))
-        lines.append("  last knock at Z %.3f (%.3f mm below the verify waypoint), spread %.3f mm"
-                     % (median(lasts), top - median(lasts), max(lasts) - min(lasts)))
     coarse = seat.get('coarse')
     if coarse:
-        lines.append("  first lift at path speed: %s" % (
-            ', '.join('Z %.3f (%.1f g)' % (e['z'], e['peak_g']) for e in coarse['events']) or 'no knock'))
+        if coarse['events']:
+            main = max(coarse['events'], key=lambda e: e['peak_g'])
+            lines.append("  first lift at path speed: the strongest knock is at Z %.3f (%.1f g), %.3f mm below the "
+                         "verify waypoint" % (main['z'], main['peak_g'], top - main['z']))
+            lines.append("  all knocks of the first lift: %s" % ', '.join(
+                'Z %.3f (%.1f g)' % (e['z'], e['peak_g']) for e in coarse['events']))
+        else:
+            lines.append("  first lift at path speed: no knock")
         if seat.get('slow_from_z') is not None:
             lines.append("  the slow part of the later lifts starts at Z %.3f (%g mm/s)"
                          % (seat['slow_from_z'], seat['speed']))
-    lines.append("  the knock is the contact of the shuttle with the tool; the path continues until the verify "
-                 "waypoint, so the last knock is that far below it")
+    if mains:
+        lines.append("  strongest knock of the later lifts: Z %.3f (median), %.3f .. %.3f over the positions"
+                     % (median(mains), min(mains), max(mains)))
     return lines
 
 
 def seat_table(tool, axis, rows, window):
     """The seat test of one axis as text lines"""
-    lines = ["Seat test T%d %s: knocks of the lift into the shuttle (g after a %d ms high-pass; z in mm; lateral = "
-             "share of the knock energy in x and y; ix iy = net velocity change in x and y in mm/s; medians of "
-             "the repeats)" % (tool, axis.upper(), int(round(window * 1000))),
-             " offset  pin  events  z_first   z_last  peak1  peakN  lateral      ix      iy  release"]
+    lines = ["Seat test T%d %s: the lift into the shuttle at positions along the axis (g after a %d ms high-pass; "
+             "z of the strongest knock in mm; energy = of the whole lift, g^2 s; lateral = share of the knock energy "
+             "in x and y; ix iy = net velocity change in x and y in mm/s; release = knock while it goes down; "
+             "medians of the repeats)" % (tool, axis.upper(), int(round(window * 1000))),
+             " offset  pin  events   z_main   peak  energy  lateral      ix      iy  release"]
 
     def num(v, fmt):
         return fmt % v if v is not None else ' ' * len(fmt % 0)
     for r in sorted(rows, key=lambda r: r['offset']):
-        lines.append("%+7.2f  %d/%d  %s  %s  %s  %s  %s  %s  %s  %s  %s" % (
-            r['offset'], r['pin'], r['total'], num(r['events'], '%6.1f'), num(r['z_first'], '%8.3f'),
-            num(r['z_last'], '%8.3f'), num(r['peak_first'], '%5.2f'), num(r['peak_last'], '%5.2f'),
-            num(r['lateral'], '%7.2f'), num(r['ix'], '%7.1f'), num(r['iy'], '%7.1f'), num(r['release_g'], '%7.2f')))
-    done = [r for r in rows if r['lateral'] is not None]
-    if done:
-        low = min(done, key=lambda r: r['lateral'])
-        lines.append("Lowest lateral share: %+.2f mm (%.2f)" % (low['offset'], low['lateral']))
-        for key in ('ix', 'iy'):
-            crossings = seat_crossings(rows, key)
-            if crossings:
-                lines.append("Net velocity change %s changes sign at %s mm" % (
-                    key[1], ', '.join('%+.2f' % c for c in crossings)))
+        lines.append("%+7.2f  %d/%d  %s  %s  %s  %s  %s  %s  %s  %s" % (
+            r['offset'], r['pin'], r['total'], num(r['events'], '%6.1f'), num(r.get('z_main'), '%8.3f'),
+            num(r.get('peak_all'), '%5.2f'), num(r.get('energy'), '%7.3f'), num(r['lateral'], '%7.2f'),
+            num(r['ix'], '%7.1f'), num(r['iy'], '%7.1f'), num(r['release_g'], '%7.2f')))
     lines.append("Nothing is changed by the seat test. Pin = lifts for which the tool detection was on at the top.")
     return lines
 
@@ -1046,8 +1131,14 @@ class DockAutotune:
         events = [dict(e, z=event_height(e['t'], segments), rel=event_height(e['t'], segments) - top_z)
                   for e in events]
         release = knock_metrics(samples, t_hold, t_low, self.adxl_window)
-        return {'pin': pin, 'events': events, 'noise_g': noise, 'limit_g': limit,
-                'release_g': release['peak_g'] if release else None}
+        energy, lift_peak = 0.0, 0.0
+        part = [sm for sm in samples if t_quiet <= sm[0] <= t_hold]
+        if len(part) >= 40:
+            _, rate, (rx, ry, rz) = residuals(part, self.adxl_window)
+            squares = [a * a + b * b + c * c for a, b, c in zip(rx, ry, rz)]
+            energy, lift_peak = sum(squares) / rate, math.sqrt(max(squares))
+        return {'pin': pin, 'events': events, 'noise_g': noise, 'limit_g': limit, 'energy_g2s': energy,
+                'lift_peak_g': lift_peak, 'release_g': release['peak_g'] if release else None}
 
     def _seat_position(self, tool, sp, axis, offset, repeats, slow_from):
         dx, dy = (offset, 0.0) if axis == 'x' else (0.0, offset)
@@ -1130,7 +1221,10 @@ class DockAutotune:
                     rows.append(row)
                     fails[sign] = 0 if row['ok'] else fails[sign] + 1
                     stopped[sign] = fails[sign] >= self.seat_fail_stop
-                gcmd.respond_info('\n'.join(seat_table(number, axis, rows, self.adxl_window)))
+                proposal = seat_proposal(axis, rows)
+                info.setdefault('proposals', {})[axis] = proposal
+                gcmd.respond_info('\n'.join(seat_table(number, axis, rows, self.adxl_window) +
+                                            ["Quiet window %s: %s" % (axis.upper(), proposal['text'])]))
             if not axes:
                 self.seat_rows['z'] = [center]
         except AbortScan:
@@ -1140,7 +1234,7 @@ class DockAutotune:
                 logging.exception("dock_autotune: the shuttle could not leave the dock")
             raise
         self._seat_leave(sp)
-        gcmd.respond_info('\n'.join(seat_summary(info)))
+        gcmd.respond_info('\n'.join(seat_summary(info) + seat_suggestions(info, number)))
         return sp
 
     # -- commands -------------------------------------------------------------------

@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), 'klipper', 'extras'))
 
 import dock_autotune  # noqa: E402
 from dock_autotune import (event_height, find_events, height_at, move_duration, parse_lift,  # noqa: E402
-                           seat_crossings, seat_enter_lines, seat_exit_lines, seat_row)
+                           seat_crossings, seat_enter_lines, seat_exit_lines, seat_proposal, seat_row)
 from test_dock_autotune import (CommandError, FakeConfig, FakeDock, FakeGcmd, FakePrinter, FakePrintStats,  # noqa: E402
                                 FakeTool, FakeGcode, FakeToolhead)
 
@@ -196,9 +196,11 @@ class SeatToolhead(FakeToolhead):
 class Rig:
     """The shuttle: trapezoid moves, and a knock when it rises through the contact heights of the dock"""
 
-    def __init__(self, dock, toolhead, contacts=CONTACTS, truth=TRUTH, gain=2.0, knocks=(6.0, 4.0), accel=500.0):
+    def __init__(self, dock, toolhead, contacts=CONTACTS, truth=TRUTH, gain=2.0, knocks=(6.0, 4.0), accel=500.0,
+                 quiet_at_truth=False):
         self.dock, self.toolhead, self.contacts, self.truth, self.gain, self.knocks = dock, toolhead, contacts, truth, gain, knocks
         self.accel = accel
+        self.quiet_at_truth = quiet_at_truth        # the whole knock gets weaker the nearer the shuttle is
         self.pos = [0.0, 100.0, 300.0]
         self.moves = []
         self.mounted = False
@@ -270,7 +272,8 @@ class Rig:
                 if t is None or not start <= t <= end:
                     continue
                 ex, ey = self.lateral(move['p0'])
-                amp = (self.gain * ex, self.gain * ey, self.knocks[k])
+                scale = 0.1 + math.hypot(ex, ey) if self.quiet_at_truth else 1.0
+                amp = (self.gain * ex, self.gain * ey, self.knocks[k] * scale)
                 for j in range(int(0.03 * RATE)):
                     i = int(round((t - start) * RATE)) + j
                     if 0 <= i < n:
@@ -303,6 +306,45 @@ class SeatChip:
                         chip_rig.contacts = saved
                 return chip.rig.samples(start, end)
         return Client()
+
+
+def energy_rows(energies, step=0.25, first=None):
+    first = -step * (len(energies) // 2) if first is None else first
+    return [{'offset': round(first + i * step, 4), 'value': round(10.0 + first + i * step, 4), 'energy': e}
+            for i, e in enumerate(energies)]
+
+
+class SeatProposalTests(unittest.TestCase):
+    def test_the_centre_of_the_quiet_window(self):
+        rows = energy_rows([1.0, 0.9, 0.1, 0.05, 0.1, 0.8, 1.0])           # -0.75 .. +0.75
+        p = seat_proposal('x', rows)
+        self.assertEqual(p['state'], 'ok')
+        self.assertAlmostEqual(p['offset'], 0.0, places=3)
+        self.assertAlmostEqual(p['value'], 10.0, places=3)
+        self.assertEqual((p['minus'], p['plus']), (-0.375, 0.375))
+        self.assertIn('quiet from -0.38 to +0.38 mm', p['text'])
+
+    def test_the_window_is_not_in_the_middle(self):
+        p = seat_proposal('y', energy_rows([1.0, 0.1, 0.05, 0.1, 0.9, 1.0, 1.0]))
+        self.assertEqual(p['state'], 'ok')
+        self.assertAlmostEqual(p['offset'], -0.25 + 0.0, delta=0.13)
+
+    def test_open_window_asks_for_a_larger_range(self):
+        p = seat_proposal('y', energy_rows([0.05, 0.05, 0.06, 0.07, 0.9, 1.0, 1.0]))      # quiet to the minus end
+        self.assertEqual(p['state'], 'open')
+        self.assertIsNone(p['value'])
+        self.assertIn('minus side', p['text'])
+        self.assertIn('raise seat_range', p['text'])
+
+    def test_the_widest_closed_run_wins(self):
+        p = seat_proposal('x', energy_rows([1.0, 0.05, 1.0, 0.9, 0.05, 0.06, 0.05, 0.1, 1.0, 1.0], first=-1.0))
+        self.assertEqual(p['state'], 'ok')
+        self.assertGreater(p['offset'], 0.0)
+
+    def test_nothing_to_see(self):
+        self.assertEqual(seat_proposal('x', energy_rows([0.10, 0.12, 0.09, 0.11, 0.10]))['state'], 'flat')
+        self.assertEqual(seat_proposal('x', energy_rows([0.1, 0.9]))['state'], 'no data')
+        self.assertEqual(seat_proposal('x', [{'offset': 0.0, 'value': 1.0}] * 5)['state'], 'no data')
 
 
 class SeatCommandTests(unittest.TestCase):
@@ -405,6 +447,35 @@ class SeatCommandTests(unittest.TestCase):
         self.assertEqual(offsets, [-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0])
         self.assertEqual(sorted(r['offset'] for r in rows if not r['ok']), [-1.5, -1.0, 1.5, 2.0])
 
+    def test_the_quiet_window_gives_a_suggestion_and_applies_nothing(self):
+        self.make()
+        self.rig.quiet_at_truth = True
+        gcmd = self.seat(T=2, AXES='x', RANGE=1.0, STEP=0.25, REPEATS=1)
+        self.assertNotIn('STOPPED', gcmd.text)
+        p = self.module.seat_info['proposals']['x']
+        self.assertEqual(p['state'], 'ok')
+        self.assertAlmostEqual(p['offset'], 0.2, delta=0.12)        # the dock is 0.2 mm off in x
+        self.assertAlmostEqual(p['value'], 149.6 + p['offset'], places=3)
+        self.assertIn('Quiet window X: quiet from', gcmd.text)
+        self.assertIn('SET_TOOL_PARAMETER T=2 PARAMETER=params_park_x VALUE=%.3f' % p['value'], gcmd.text)
+        self.assertEqual(self.tool.params['params_park_x'], 149.6)
+        text = self.report()[1]
+        self.assertIn('Suggested park positions (nothing is applied)', text)
+        self.assertIn('->  params_park_x: %.3f' % p['value'], text)
+        self.assertIn('not changed, the quiet window suggests %.3f' % p['value'], text)
+        self.assertIn('No park position was changed.', text)
+
+    def test_a_window_outside_of_the_range_is_not_suggested(self):
+        self.make()
+        self.rig.quiet_at_truth = True
+        self.rig.truth = {'x': 151.6, 'y': TRUTH['y']}               # 2 mm away: the range ends before the window
+        self.rig.contacts = CONTACTS
+        gcmd = self.seat(T=2, AXES='x', RANGE=1.0, STEP=0.25, REPEATS=1)
+        p = self.module.seat_info['proposals']['x']
+        self.assertIn(p['state'], ('open', 'flat'))
+        self.assertIsNone(p['value'])
+        self.assertNotIn('SET_TOOL_PARAMETER', gcmd.text)
+
     def test_z_only(self):
         self.make()
         gcmd = self.seat(T=2, AXES='z', REPEATS=2)
@@ -485,7 +556,7 @@ class SeatCommandTests(unittest.TestCase):
         self.assertIn('result file', gcmd.text)
         self.assertIn('seat test', text.splitlines()[0])
         self.assertIn('Lift into the shuttle: park Z 266.200, verify waypoint at Z 266.200', text)
-        self.assertIn('first knock at Z 264.9', text)
+        self.assertIn('the strongest knock is at Z 264.9', text)
         self.assertIn('Seat test T2 X', text)
         self.assertIn('height of the contact measured', text)
         self.assertIn('No park position was changed.', text)
