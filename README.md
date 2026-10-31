@@ -167,19 +167,38 @@ wobbles in the dock before, and it falls back into the dock when the shuttle goe
 fall rises with the misalignment: the tool has to be lifted further. If the position is right, the pins just dive in,
 the tool stays where it is and nothing is measured. So **quiet is good**.
 
-**Result, per position** (medians over the repeats): the pin at the top, the number of knocks, the height and strength
-of the strongest knock, the **energy of the whole hub** (every knock, also the small ones, the lift, the hold and the way
-down), the **wobble** (slow sideways movement of the tool in the dock, x and y after a longer high-pass,
-`wobble_window`), and the **score**, energy plus wobble. The score is the one number that says how much the tool moves.
-The result file has more columns (lateral share, net velocity change) for a look at the raw numbers.
+**What you get.** For X and for Y a small chart, one line per position:
 
-* **Quiet window (the suggestion).** For X and for Y the module takes the positions whose score is in the lowest
-  quarter between the lowest and the highest, looks for a run of them with a louder position on **both** sides, and
-  suggests its centre as the new `params_park_x/y` together with a ready `SET_TOOL_PARAMETER` line. Nothing is applied:
-  try the value, then run the seat test again around it and check that the position is quiet and the window is
-  centred. If the quiet range reaches the end of the measured range on one side, the centre of the measured part is
-  suggested and marked *open on that side*: the real centre lies further that way. If there is no louder position at
-  all, the message says so; if all positions are alike, it says that too.
+```
+T0 Y axis  (bar = how much the tool moved, compared with the calmest position, which scored 0.087)
+   offset   position   movement
+   -1.00    -31.700   ######                         FAIL: the tool was not caught
+   -0.50    -31.200   ###                            quiet
+   +0.00    -30.700   ###                            quiet   <- current
+   +0.50    -30.200   ####                           quiet
+   +1.00    -29.700   ################               LOUD
+  => Y: Quiet from -31.45 to -29.95 (1.50 mm wide), centre -30.70. The current position is in the centre (0.00 mm off), no change needed.
+```
+
+The bar is the **score** of the position (energy of all knocks of the lift, the hold and the way down, plus the slow
+sideways wobble of the tool in the dock), compared with the calmest position of that axis where the tool was caught:
+**quiet** up to 1.6 times, **rough** up to 3 times, **LOUD** above, **FAIL** if the tool detection was off at the top.
+The line with `=>` is the verdict; the park positions table (current, new) and the lines for the tool file follow. The
+tables with all numbers (knock heights, energy, wobble, lateral share, release) are at the end of the result file.
+
+* **Quiet window (the suggestion).** The window is the run of quiet positions with a position that is not quiet on
+  **both** sides; its centre is the best position. A park position within `seat_tolerance` (0.15 mm) of the centre is
+  kept. If the window is cut off by the measured range on one side, the centre of the measured part is suggested and
+  marked *open on that side*: the real centre lies further that way. A ready `SET_TOOL_PARAMETER` line lets you try a
+  new value without editing the tool file; measure again around it.
+
+**What this can and cannot tell.** The accelerometer sits on the tool. It sees whether the tool is lifted, falls, knocks
+or wobbles while the pins find their holes: a position that is quiet is one where the pins dive in without moving the
+tool. It does not see a pin that touches the wall of its bushing and slides without moving the tool, so quiet is
+necessary for clean insertion, not proof of it. The rating is relative to the calmest position of the axis: if the
+whole range were loud, it would still call the calmest part quiet, so look at the score in the chart header (in our
+runs about 0.05 to 0.11 when quiet, 0.3 to 0.7 when loud). Edges are known to about the step width (0.25 mm).
+
 * **Z:** the strongest knock is where shuttle and tool touch or snap. The path continues up to the `verify` waypoint, so
   the distance between the two is how far the path goes on; the result file shows both.
 

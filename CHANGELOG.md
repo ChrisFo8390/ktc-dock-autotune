@@ -2,6 +2,23 @@
 
 The project is a prototype; the entries explain what changed and why, newest first.
 
+## 2026-11-01: a chart instead of tables
+
+The console and the result file were too hard to read. Now every axis is a small chart (offset, position, a bar for how
+much the tool moved, and a word: quiet, rough, LOUD, FAIL) with a one-line verdict, then the table with the current and
+the new park position and the lines for the tool file. The tables with all numbers moved to "Details" at the end of the
+result file.
+
+* The words are relative to the calmest position of the axis: quiet up to 1.6 times, rough up to 3 times, LOUD above.
+  A position where the tool detection was off at the top is FAIL and always an edge of the window. (Before, a FAIL row
+  whose score happened to be low counted as quiet; in the Y scan of the run at Y -30.7 the row at -31.7 would have
+  extended the window.)
+* A park position within `seat_tolerance` (0.15 mm) of the centre of the window is kept ("no change needed").
+* An axis that was not finished (the run stopped) gets its verdict from the positions measured so far.
+* With the data of the stopped run of 22:20 the new rating gives: X quiet from 1.60 to 4.35 (open on the minus side),
+  current 3.10 is in the middle of the measured part; Y quiet from -31.45 to -29.95 (both edges found, -31.7 failed, +1.0
+  loud), centre -30.70.
+
 ## 2026-10-31 (late night): smaller range, safety, open windows
 
 A run with `RANGE_X=1.5 RANGE_Y=2.0` (recommended in the previous round) showed that this is too much: at X +1.5 mm the tool

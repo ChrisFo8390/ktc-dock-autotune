@@ -11,7 +11,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), 'klipper', 'extras'))
 
 import dock_autotune  # noqa: E402
 from dock_autotune import (event_height, find_events, height_at, move_duration, parse_lift,  # noqa: E402
-                           seat_crossings, seat_enter_lines, seat_exit_lines, seat_proposal, seat_row)
+                           seat_chart, seat_crossings, seat_enter_lines, seat_exit_lines, seat_proposal, seat_rate,
+                           seat_row)
 from test_dock_autotune import (CommandError, FakeConfig, FakeDock, FakeGcmd, FakePrinter, FakePrintStats,  # noqa: E402
                                 FakeTool, FakeGcode, FakeToolhead)
 
@@ -315,58 +316,90 @@ class SeatChip:
         return Client()
 
 
-def energy_rows(energies, step=0.25, first=None):
+def energy_rows(energies, step=0.25, first=None, failed=()):
     first = -step * (len(energies) // 2) if first is None else first
-    return [{'offset': round(first + i * step, 4), 'value': round(10.0 + first + i * step, 4), 'score': e}
-            for i, e in enumerate(energies)]
+    return [{'offset': round(first + i * step, 4), 'value': round(10.0 + first + i * step, 4), 'score': e,
+             'ok': i not in failed} for i, e in enumerate(energies)]
+
+
+class SeatRatingTests(unittest.TestCase):
+    def test_words_compared_with_the_quietest_position(self):
+        floor, rated = seat_rate(energy_rows([0.05, 0.07, 0.10, 0.2, 0.3], failed=(4,)))
+        self.assertEqual(floor, 0.05)
+        self.assertEqual([r[1] for r in rated], ['quiet', 'quiet', 'rough', 'LOUD', 'FAIL'])
+
+    def test_a_failed_position_is_never_the_floor(self):
+        floor, rated = seat_rate(energy_rows([0.01, 0.05, 0.06], failed=(0,)))
+        self.assertEqual(floor, 0.05)
+        self.assertEqual(rated[0][1], 'FAIL')
+
+    def test_chart(self):
+        rows = energy_rows([0.30, 0.05, 0.05, 0.05, 0.30], step=0.5)
+        rows[0]['ok'] = False
+        text = '\n'.join(seat_chart(0, 'y', rows))
+        self.assertIn('T0 Y axis', text)
+        self.assertIn('FAIL: the tool was not caught', text)
+        self.assertIn('+0.00     10.000   ###', text)
+        self.assertIn('<- current', text)
+        rows_only = [line for line in text.splitlines() if line.startswith('  ') and line.strip()[0] in '+-']
+        self.assertEqual(sum(1 for line in rows_only if 'quiet' in line), 3)
+        self.assertEqual(sum(1 for line in rows_only if 'LOUD' in line), 1)
+        self.assertIn('scored 0.050', text)
 
 
 class SeatProposalTests(unittest.TestCase):
-    def test_the_centre_of_the_quiet_window(self):
-        rows = energy_rows([1.0, 0.9, 0.1, 0.05, 0.1, 0.8, 1.0])           # -0.75 .. +0.75
-        p = seat_proposal('x', rows)
+    def test_the_current_position_is_in_the_centre(self):
+        p = seat_proposal('x', energy_rows([0.3, 0.3, 0.05, 0.05, 0.05, 0.3, 0.3]))           # -0.75 .. +0.75
         self.assertEqual(p['state'], 'ok')
-        self.assertAlmostEqual(p['offset'], 0.0, places=3)
-        self.assertAlmostEqual(p['value'], 10.0, places=3)
-        self.assertEqual((p['minus'], p['plus']), (-0.375, 0.375))
-        self.assertIn('quiet from -0.38 to +0.38 mm', p['text'])
+        self.assertEqual((p['minus'], p['plus'], p['offset']), (-0.375, 0.375, 0.0))
+        self.assertEqual(p['value'], 10.0)
+        self.assertIn('Quiet from 9.62 to 10.38 (0.75 mm wide), centre 10.00.', p['text'])
+        self.assertIn('no change needed', p['text'])
 
-    def test_the_window_is_not_in_the_middle(self):
-        p = seat_proposal('y', energy_rows([1.0, 0.1, 0.05, 0.1, 0.9, 1.0, 1.0]))
+    def test_the_window_is_off_centre(self):
+        p = seat_proposal('y', energy_rows([0.3, 0.05, 0.05, 0.05, 0.3, 0.3, 0.3]))
         self.assertEqual(p['state'], 'ok')
-        self.assertAlmostEqual(p['offset'], -0.25 + 0.0, delta=0.13)
+        self.assertEqual(p['offset'], -0.25)
+        self.assertEqual(p['value'], 9.75)
+        self.assertIn('Move by -0.25 mm to 9.750.', p['text'])
+
+    def test_small_differences_are_kept(self):
+        p = seat_proposal('y', energy_rows([0.3, 0.05, 0.05, 0.05, 0.05, 0.3, 0.3], step=0.1))       # centre -0.05
+        self.assertEqual(p['value'], 10.0)
 
     def test_a_window_open_on_one_side_suggests_the_centre_of_the_measured_part(self):
         p = seat_proposal('y', energy_rows([0.05, 0.05, 0.06, 0.07, 0.9, 1.0, 1.0]))      # quiet to the minus end
         self.assertEqual(p['state'], 'one-sided')
         self.assertEqual((p['minus'], p['plus']), (-0.75, 0.125))
         self.assertAlmostEqual(p['offset'], -0.312, places=3)
-        self.assertIn('open on the minus side', p['text'])
+        self.assertIn('minus edge was not reached', p['text'])
         self.assertIn('further towards minus', p['text'])
+
+    def test_a_failed_position_is_an_edge(self):
+        # the pins do not catch the tool at the minus end: score looks quiet, the position is not
+        p = seat_proposal('y', energy_rows([0.09, 0.05, 0.05, 0.05, 0.4, 0.5], failed=(0,), first=-1.0, step=0.5))
+        self.assertEqual(p['state'], 'ok')
+        self.assertEqual((p['minus'], p['plus']), (-0.75, 0.75))
 
     def test_two_quiet_bands_each_open_on_one_side_take_the_wider(self):
         # the first run of the user: quiet far left (3 positions) and quiet right (4 positions) of a loud band
         p = seat_proposal('x', energy_rows([0.10, 0.12, 0.12, 0.32, 0.32, 0.09, 0.08, 0.08, 0.09], first=-1.0))
         self.assertEqual(p['state'], 'one-sided')
         self.assertGreater(p['offset'], 0.2)
-        self.assertIn('open on the plus side', p['text'])
+        self.assertIn('plus edge was not reached', p['text'])
 
-    def test_no_edge_at_all(self):
-        # quiet at both ends of the range and a louder part in the middle only for one position at the end
-        p = seat_proposal('x', energy_rows([0.05, 0.05, 0.05, 0.5, 0.05, 0.05, 0.05]))
-        self.assertIn(p['state'], ('ok', 'one-sided'))
-        p = seat_proposal('x', energy_rows([0.05, 0.9, 0.9, 0.9, 0.05]))       # single quiet positions at the ends
+    def test_quiet_everywhere_has_no_edge(self):
+        p = seat_proposal('x', energy_rows([0.05, 0.06, 0.05, 0.06, 0.05]))
         self.assertEqual(p['state'], 'open')
         self.assertIsNone(p['value'])
         self.assertIn('no edge found', p['text'])
 
-    def test_the_widest_closed_run_wins(self):
-        p = seat_proposal('x', energy_rows([1.0, 0.05, 1.0, 0.9, 0.05, 0.06, 0.05, 0.1, 1.0, 1.0], first=-1.0))
-        self.assertEqual(p['state'], 'ok')
-        self.assertGreater(p['offset'], 0.0)
+    def test_the_tool_was_never_caught(self):
+        p = seat_proposal('x', energy_rows([0.05, 0.5, 0.5, 0.5, 0.05], failed=(0, 1, 2, 3, 4)))
+        self.assertEqual(p['state'], 'no data')
+        self.assertIn('not caught at any position', p['text'])
 
-    def test_nothing_to_see(self):
-        self.assertEqual(seat_proposal('x', energy_rows([0.10, 0.12, 0.09, 0.11, 0.10]))['state'], 'flat')
+    def test_too_few_positions(self):
         self.assertEqual(seat_proposal('x', energy_rows([0.1, 0.9]))['state'], 'no data')
         self.assertEqual(seat_proposal('x', [{'offset': 0.0, 'value': 1.0}] * 5)['state'], 'no data')
 
@@ -480,13 +513,14 @@ class SeatCommandTests(unittest.TestCase):
         self.assertEqual(p['state'], 'ok')
         self.assertAlmostEqual(p['offset'], 0.2, delta=0.12)        # the dock is 0.2 mm off in x
         self.assertAlmostEqual(p['value'], 149.6 + p['offset'], places=3)
-        self.assertIn('Quiet window X: quiet from', gcmd.text)
+        self.assertIn('=> X: Quiet from', gcmd.text)
+        self.assertIn('LOUD', gcmd.text)
         self.assertIn('SET_TOOL_PARAMETER T=2 PARAMETER=params_park_x VALUE=%.3f' % p['value'], gcmd.text)
         self.assertEqual(self.tool.params['params_park_x'], 149.6)
         text = self.report()[1]
         self.assertIn('Suggested new park positions (copy them into', text)
         self.assertIn('  params_park_x: %.3f' % p['value'], text)
-        self.assertIn('%10.3f   quiet from' % p['value'], text)
+        self.assertRegex(text, r'  x +149[.]600 +%.3f +move by [+-][0-9][.][0-9]{2} mm' % p['value'])
         self.assertNotIn('changed', text)
 
     def test_the_wobble_of_the_tool_is_measured_and_counts(self):

@@ -151,12 +151,14 @@ def _park_result(axis, info):
         if axis == 'z':
             return None, 'no suggestion for Z; the contact height is given below'
         proposal = seat.get('proposals', {}).get(axis)
+        if not proposal and seat.get('rows', {}).get(axis):
+            proposal = dict(seat_proposal(axis, seat['rows'][axis]), unfinished=True)
         if proposal and proposal['value'] is not None:
-            return proposal['value'], proposal['text']
+            return proposal['value'], proposal['short'] + (' (the run was stopped before this axis was finished)'
+                                                          if proposal.get('unfinished') else '')
         if proposal:
-            return None, 'no suggestion: ' + proposal['text']
-        return None, ('no suggestion yet, the axis was not finished' if axis in seat.get('rows', {})
-                      else 'not measured')
+            return None, 'no suggestion: ' + proposal['short']
+        return None, 'not measured'
     if info.get('new', {}).get(axis) is not None:
         return info['new'][axis], 'centred, window %+.3f .. %+.3f mm (%.3f wide)' % (
             entry['minus'], entry['plus'], entry['width'])
@@ -215,7 +217,15 @@ def build_report(info):
              "Settings: " + ', '.join(info['settings']), ""]
     lines.extend(park_section(info))
     if info.get('seat'):
-        lines.append("")
+        for axis in 'xy':
+            rows = info['seat']['rows'].get(axis)
+            if rows:
+                lines.append("")
+                lines.extend(seat_chart(tool, axis, rows))
+                proposal = info['seat'].get('proposals', {}).get(axis)
+                if proposal:
+                    lines.append("  => %s: %s" % (axis.upper(), proposal['text']))
+        lines.extend(["", "Details (for a closer look; the CSV block below has all numbers)", ""])
         lines.extend(seat_summary(info['seat']))
         for axis in AXES:
             if info['seat']['rows'].get(axis):
@@ -489,60 +499,109 @@ def seat_crossings(rows, key):
             for (o1, v1), (o2, v2) in zip(points, points[1:]) if v1 * v2 < 0]
 
 
-def seat_proposal(axis, rows, quiet_part=0.25):
+QUIET_RATIO = 1.6       # a score up to 1.6 times the quietest position of the axis is quiet
+LOUD_RATIO = 3.0        # from 3 times it is loud, in between rough
+
+
+def seat_rate(rows):
     """
-    The quiet window along one axis: the positions where the tool is clearly calmer than at the others. The measure
-    is the score of the whole hub (every knock, also the small ones, and the wobble in the dock). A position is quiet
-    if its score is in the lowest quarter between the lowest and the highest one. The window is a run of quiet positions with a louder one on
-    both sides; its centre is suggested. Returns state (ok, open, flat, no data), offset and value of the centre,
-    the edges, and a text.
+    Rating of every position of one axis, compared with the quietest position where the tool was caught: FAIL (the
+    tool detection was off at the top), quiet, rough or LOUD. Returns (floor, [(row, rating, ratio)]) sorted by offset.
     """
-    points = sorted((r['offset'], r['score'], r['value']) for r in rows if r.get('score') is not None)
-    if len(points) < 4:
-        return {'state': 'no data', 'text': 'too few positions measured', 'value': None}
-    energies = [e for _, e, _ in points]
-    low, high = min(energies), max(energies)
-    if high < 2.0 * low:
-        return {'state': 'flat', 'value': None,
-                'text': 'no clear difference between the positions (score %.3f .. %.3f)' % (low, high)}
-    level = low + quiet_part * (high - low)
+    caught = [r['score'] for r in rows if r.get('ok', True) and r.get('score')]
+    floor = min(caught) if caught else None
+    rated = []
+    for r in sorted(rows, key=lambda r: r['offset']):
+        if not r.get('ok', True):
+            rated.append((r, 'FAIL', (r['score'] / floor) if floor and r.get('score') else None))
+        elif floor is None or not r.get('score'):
+            rated.append((r, '?', None))
+        else:
+            ratio = r['score'] / floor
+            rated.append((r, 'quiet' if ratio < QUIET_RATIO else 'rough' if ratio < LOUD_RATIO else 'LOUD', ratio))
+    return floor, rated
+
+
+def seat_chart(tool, axis, rows):
+    """One axis as a small chart: every position with a bar for how much the tool moved and a word for it"""
+    floor, rated = seat_rate(rows)
+    lines = ["T%d %s axis  (bar = how much the tool moved, compared with the calmest position, which scored %s)"
+             % (tool, axis.upper(), '%.3f' % floor if floor else '-'), "   offset   position   movement"]
+    words = {'FAIL': 'FAIL: the tool was not caught', 'LOUD': 'LOUD', 'rough': 'rough', 'quiet': 'quiet', '?': ''}
+    for row, rating, ratio in rated:
+        bar = '#' * max(1, min(30, int(round(ratio * 3)))) if ratio else ''
+        lines.append("  %+6.2f  %9.3f   %-30s %s%s" % (row['offset'], row['value'], bar, words[rating],
+                                                         '   <- current' if abs(row['offset']) < 1e-9 else ''))
+    return lines
+
+
+def seat_proposal(axis, rows, tolerance=0.15):
+    """
+    The quiet window along one axis: the run of positions that are quiet (see seat_rate) with a rougher, louder or
+    failed position on both sides; the centre of the window is the best position. A window that is cut off by the
+    measured range on one side gives the centre of the measured part, marked as open on that side. A current position
+    within `tolerance` mm of the centre is kept. Returns state (ok, one-sided, open, no data), offset and value of the
+    centre (value is the current position if it is kept), the edges, and a text.
+    """
+    floor, rated = seat_rate(rows)
+    if floor is None:
+        return {'state': 'no data', 'value': None, 'short': 'the tool was not caught',
+                'text': 'The tool was not caught at any position.'}
+    if len(rated) < 4:
+        return {'state': 'no data', 'value': None, 'short': 'too few positions',
+                'text': 'Too few positions measured.'}
+    points = [(r['offset'], rating == 'quiet', r['value']) for r, rating, _ in rated]
     runs, start = [], None
-    for i, (_, e, _) in enumerate(points + [(0, high + 1, 0)]):
-        if e <= level and start is None:
+    for i, (_, quiet, _) in enumerate(points + [(0, False, 0)]):
+        if quiet and start is None:
             start = i
-        elif e > level and start is not None:
+        elif not quiet and start is not None:
             runs.append((start, i - 1))
             start = None
     park = median([v - o for o, _, v in points])
+    last = len(points) - 1
 
     def edge(i, j):
         return (points[i][0] + points[j][0]) / 2.0
 
-    closed = [(a, b) for a, b in runs if a > 0 and b < len(points) - 1]
+    def result(state, minus, plus, centre, text):
+        keep = abs(centre) <= tolerance
+        value = park if keep else park + centre
+        action = ('The current position is in the centre (%.2f mm off), no change needed.' % abs(centre) if keep
+                  else 'Move by %+.2f mm to %.3f.' % (centre, value))
+        short = 'in the centre, no change' if keep else 'move by %+.2f mm' % centre
+        if state == 'one-sided':
+            short += ' (window open on the %s side)' % ('minus' if minus == points[0][0] else 'plus')
+        return {'state': state, 'offset': round(centre, 3), 'value': round(value, 3), 'minus': round(minus, 3),
+                'plus': round(plus, 3), 'short': short, 'text': text + ' ' + action}
+
+    closed = [(a, b) for a, b in runs if a > 0 and b < last]
     if closed:
-        a, b = max(closed, key=lambda run: (points[run[1]][0] - points[run[0]][0], -sum(points[k][1] for k in range(run[0], run[1] + 1))))
+        a, b = max(closed, key=lambda run: (points[run[1]][0] - points[run[0]][0],
+                                            -sum(1 for k in range(run[0], run[1] + 1) if not points[k][1])))
         minus, plus = edge(a - 1, a), edge(b, b + 1)
-        centre = (minus + plus) / 2.0
-        return {'state': 'ok', 'offset': round(centre, 3), 'value': round(park + centre, 3), 'minus': round(minus, 3),
-                'plus': round(plus, 3), 'text': 'quiet from %+.2f to %+.2f mm around the park position (%.2f mm wide), '
-                                                 'centre %+.2f mm' % (minus, plus, plus - minus, centre)}
-    # a run with a louder position on one side only: the other edge is outside of the measured range. The centre of
-    # the measured part is suggested; the real centre lies further towards the open side
-    one_sided = [(a, b) for a, b in runs if b > a and (a == 0) != (b == len(points) - 1)]
+        return result('ok', minus, plus, (minus + plus) / 2.0,
+                      'Quiet from %.2f to %.2f (%.2f mm wide), centre %.2f.' % (park + minus, park + plus, plus - minus,
+                                                                              park + (minus + plus) / 2.0))
+    one_sided = [(a, b) for a, b in runs if (a == 0) != (b == last)]
     if one_sided:
         a, b = max(one_sided, key=lambda run: points[run[1]][0] - points[run[0]][0])
         side = 'minus' if a == 0 else 'plus'
         minus, plus = (points[0][0], edge(b, b + 1)) if a == 0 else (edge(a - 1, a), points[-1][0])
         centre = (minus + plus) / 2.0
-        return {'state': 'one-sided', 'offset': round(centre, 3), 'value': round(park + centre, 3),
-                'minus': round(minus, 3), 'plus': round(plus, 3),
-                'text': 'quiet from %+.2f to %+.2f mm, open on the %s side (not measured further): the centre of the '
-                        'measured part is suggested, the real centre lies further towards %s'
-                        % (minus, plus, side, side)}
-    a, b = max(runs, key=lambda run: points[run[1]][0] - points[run[0]][0])
-    return {'state': 'open', 'value': None, 'minus': points[a][0], 'plus': points[b][0],
-            'text': 'quiet from %+.2f to %+.2f mm and no louder position within the range: no edge found, move the '
-                    'park position and measure again' % (points[a][0], points[b][0])}
+        return result('one-sided', minus, plus, centre,
+                      'Quiet from %.2f to %.2f, but the %s edge was not reached (at least %.2f mm wide). Centre of '
+                      'the measured part %.2f, the real centre is further towards %s.'
+                      % (park + minus, park + plus, side, plus - minus, park + centre, side))
+    if runs:
+        a, b = max(runs, key=lambda run: points[run[1]][0] - points[run[0]][0])
+        return {'state': 'open', 'value': None, 'minus': points[a][0], 'plus': points[b][0],
+                'short': 'no edge found, move the park position and measure again',
+                'text': 'Quiet from %.2f to %.2f and no louder position within the range: no edge found, move the '
+                        'park position and measure again.' % (park + points[a][0], park + points[b][0])}
+    return {'state': 'open', 'value': None, 'short': 'no quiet position', 'text': 'No quiet position within the '
+                                                                                  'range: move the park position and '
+                                                                                  'measure again.'}
 
 
 def seat_summary(seat):
@@ -801,6 +860,7 @@ class DockAutotune:
         self.wobble_window = config.getfloat('wobble_window', 0.2, above=0.)
         self.seat_fail_stop = config.getint('seat_fail_stop', 1, minval=1)
         self.seat_range_limit = config.getfloat('seat_range_limit', 1., above=0.)
+        self.seat_tolerance = config.getfloat('seat_tolerance', 0.15, minval=0.)
         self.seat_speed = config.getfloat('seat_speed', 2., above=0.)
         self.seat_zone = config.getfloat('seat_zone', 1.5, minval=0.)
         self.seat_range = config.getfloat('seat_range', 0.5, above=0.)
@@ -1283,10 +1343,10 @@ class DockAutotune:
                     rows.append(row)
                     fails[sign] = 0 if row['ok'] else fails[sign] + 1
                     stopped[sign] = fails[sign] >= self.seat_fail_stop
-                proposal = seat_proposal(axis, rows)
+                proposal = seat_proposal(axis, rows, self.seat_tolerance)
                 info.setdefault('proposals', {})[axis] = proposal
-                gcmd.respond_info('\n'.join(seat_table(number, axis, rows, self.adxl_window) +
-                                            ["Quiet window %s: %s" % (axis.upper(), proposal['text'])]))
+                gcmd.respond_info('\n'.join(seat_chart(number, axis, rows) +
+                                            ["  => %s: %s" % (axis.upper(), proposal['text'])]))
             if not axes:
                 self.seat_rows['z'] = [center]
         except (AbortScan, self.gcode.error):
@@ -1299,7 +1359,7 @@ class DockAutotune:
         self._seat_leave(sp)
         view = {'tool': number, 'mode': 'seat', 'status': 'finished', 'seat': info,
                 'originals': {'x': sp['x'], 'y': sp['y'], 'z': sp['z']}}
-        gcmd.respond_info('\n'.join(seat_summary(info) + [''] + park_section(view)))
+        gcmd.respond_info('\n'.join(seat_summary(info)[:2] + [''] + park_section(view)))
         return sp
 
     # -- commands -------------------------------------------------------------------
