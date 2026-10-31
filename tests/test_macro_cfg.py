@@ -54,7 +54,13 @@ class MacroTests(unittest.TestCase):
         for params in ({}, {'AXES': 'z'}, {'T': ''}):
             with self.assertRaises(MacroError) as ctx:
                 render(params)
-            self.assertIn('T=<tool number>', str(ctx.exception))
+            self.assertIn('T=N (the tool number)', str(ctx.exception))
+
+    def test_console_texts_have_no_html_tags(self):
+        # the console of Mainsail shows text as HTML: <s> strikes everything through, <n> disappears
+        macro = read_macro()
+        self.assertNotRegex(macro['description'], r'<[A-Za-z/]')
+        self.assertNotRegex(macro['gcode'].split('action_raise_error')[1].split(chr(10))[0], r'<[A-Za-z/]')
 
     def test_every_field_of_the_ui_is_a_parameter_of_the_macro(self):
         # Mainsail makes an input field of every params.<NAME> in the macro

@@ -532,8 +532,8 @@ class DockAutotune:
     # -- commands -------------------------------------------------------------------
 
     cmd_DOCK_AUTOTUNE_help = ("Find the window in which a tool locks and centre its dock position: "
-                              "DOCK_AUTOTUNE T=<n> [AXES=xyz] [STEP=0.1] [RANGE=<mm>] [REPEATS=2] "
-                              "[SPEED=0.5] [ADXL=1] [PREPARE=0|1] [BED=70] [SOAK=<s>] [TOUCH=0] [DRY_RUN=1]")
+                              "DOCK_AUTOTUNE T=N [AXES=xyz] [STEP=0.1] [RANGE=MM] [REPEATS=2] "
+                              "[SPEED=0.5] [ADXL=1] [PREPARE=0|1] [BED=70] [SOAK=SECONDS] [TOUCH=0] [DRY_RUN=1]")
 
     def cmd_DOCK_AUTOTUNE(self, gcmd):
         if self.active:

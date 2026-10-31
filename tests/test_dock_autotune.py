@@ -463,6 +463,15 @@ class CommandTests(unittest.TestCase):
         # 'INTERRUPT' in the name makes Klipper run it while the scan is running
         self.assertIn('DOCK_AUTOTUNE_INTERRUPT', commands)
 
+    def test_help_texts_have_no_html_tags(self):
+        # the console of Mainsail shows text as HTML: <s> strikes everything through, <n> disappears
+        import re
+        self.assertIsNone(re.search(r'<[A-Za-z/]', dock_autotune.DockAutotune.cmd_DOCK_AUTOTUNE_help))
+        with open(os.path.join(REPO, 'klipper', 'extras', 'dock_autotune.py'), encoding='utf-8') as f:
+            strings = re.findall(r'"([^"' + chr(10) + r']*)"', f.read())
+        offenders = [t for t in strings if re.search(r'<[A-Za-z/]', t) and not t.startswith('//')]
+        self.assertEqual(offenders, [])
+
     def test_a_macro_of_that_name_gets_the_name_and_calls_the_run_command(self):
         self.make(sections=['gcode_macro dock_autotune'])
         commands = self.printer.objects['gcode'].commands
