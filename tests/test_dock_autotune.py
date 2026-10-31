@@ -587,6 +587,7 @@ class CommandTests(unittest.TestCase):
             self.printer.objects['adxl345 T2'] = chip
         self.printer.objects['print_stats'] = self.stats = FakePrintStats()
         options.setdefault('log_file', os.path.join(tempfile.mkdtemp(), 'dock_autotune.jsonl'))
+        options.setdefault('results_dir', os.path.join(tempfile.mkdtemp(), 'results'))
         self.module = dock_autotune.DockAutotune(FakeConfig(self.printer, **options))
         self.truth = truth
         return self.module
@@ -887,6 +888,113 @@ class CommandTests(unittest.TestCase):
         self.assertIn('ADXL map', gcmd.text)
         self.assertIn('nothing moved', gcmd.text)
         self.assertEqual(self.dock.scripts, [])
+
+    # -- config defaults and the result file --------------------------------------------------
+
+    def report(self):
+        files = sorted(os.listdir(self.module.results_dir))
+        self.assertEqual(len(files), 1)
+        with open(os.path.join(self.module.results_dir, files[0])) as f:
+            return files[0], f.read()
+
+    def test_config_defaults_replace_the_parameters(self):
+        self.make_map(window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-1.0, 1.0)},
+                      mode='map', axes='z', map_range='0.5', map_step='0.25', map_repeats='1', adxl_raw='True')
+        gcmd = self.scan(T=2)
+        self.assertIn('ADXL map T2 Z', gcmd.text)
+        self.assertEqual(self.dock.pickups, 5)
+        self.assertEqual(self.tool.params['params_park_x'], 149.6)
+        self.assertTrue(os.listdir(self.module.raw_dir))
+        # a parameter of the call wins
+        self.make(mode='map', axes='z')
+        gcmd = self.scan(T=2, MODE='scan', AXES='x', RANGE=0.3)
+        self.assertIn('axis X', gcmd.text)
+        self.assertNotIn('ADXL map', gcmd.text)
+
+    def test_wrong_option_values(self):
+        for options in ({'mode': 'both'}, {'prepare': 'maybe'}):
+            with self.assertRaises(Exception):
+                self.make(**options)
+
+    def test_prepare_default(self):
+        self.make(prepare='no')
+        self.assertEqual(self.module.prepare_default, 0)
+        self.make(prepare='yes')
+        self.assertEqual(self.module.prepare_default, 1)
+        self.make()
+        self.assertIsNone(self.module.prepare_default)
+
+    def test_scan_writes_the_park_positions_and_the_trials(self):
+        self.make(hidden=(0.0, 0.0, 0.1))
+        gcmd = self.scan(T=2, AXES='z', RANGE=0.6, STEP=0.2)
+        name, text = self.report()
+        self.assertRegex(name, r'^T2_scan_[0-9]{8}_[0-9]{6}[.]txt$')
+        self.assertIn('result file ' + os.path.join(self.module.results_dir, name), gcmd.text)
+        self.assertIn('Status: finished', text)
+        self.assertIn('centred, window', text)
+        self.assertIn('params_park_z: %.3f' % self.tool.params['params_park_z'], text)
+        self.assertNotIn('params_park_x', text.split('Scan trials')[0].split('Put these lines')[-1])
+        self.assertIn('Scan trials Z', text)
+        self.assertIn('FAILED', text)
+        self.assertIn('tool,axis,offset_mm,value_mm,locked,peak_g', text)
+
+    def test_scan_report_with_a_window_that_is_not_closed(self):
+        self.make(hidden=(0.0, 0.0, 0.0), window={'x': (-5, 5), 'y': (-5, 5), 'z': (-5, 5)})
+        self.scan(T=2, AXES='z', RANGE=0.4, STEP=0.2)
+        text = self.report()[1]
+        self.assertIn('No park position was changed.', text)
+        self.assertIn('window not closed', text)
+
+    def test_map_report_has_the_measurements_and_the_unchanged_positions(self):
+        self.make_map(window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-1.0, 1.0)})
+        self.scan(T=2, MODE='map', AXES='z', RANGE=0.5, STEP=0.25, REPEATS=1)
+        name, text = self.report()
+        self.assertTrue(name.startswith('T2_map_'))
+        self.assertIn('ADXL map T2 Z', text)
+        self.assertIn('measured, not changed by a map', text)
+        self.assertIn('No park position was changed.', text)
+        self.assertIn('Component z changes sign at +0.10 mm', text)
+        csv = text.split('Data (CSV)')[1].strip().splitlines()
+        self.assertTrue(csv[0].startswith('tool,axis,offset_mm,value_mm,locked,total,pick_peak_g'))
+        self.assertEqual(len(csv), 1 + 5)
+        self.assertTrue(csv[1].startswith('2,z,-0.5,'))
+
+    def test_report_of_a_stopped_run(self):
+        self.make_map(hidden=(0.0, 0.0, 0.0), window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-1.0, 1.0)})
+        calls = []
+        real = self.module._map_trial
+
+        def stop_after_two(*a, **kw):
+            calls.append(1)
+            if len(calls) == 3:
+                self.module.abort = True
+            return real(*a, **kw)
+        self.module._map_trial = stop_after_two
+        self.scan(T=2, MODE='map', AXES='z', RANGE=1.0, STEP=0.25, REPEATS=1)
+        text = self.report()[1]
+        self.assertIn('Status: STOPPED: stopped by DOCK_AUTOTUNE_INTERRUPT', text)
+        self.assertEqual(len(text.split('Data (CSV)')[1].strip().splitlines()), 1 + 2)    # the third was stopped
+
+    def test_no_result_file_without_a_folder_or_without_data(self):
+        self.make(results_dir='')
+        self.scan(T=2, AXES='x', RANGE=0.3)
+        self.make()
+        self.scan(T=2, AXES='x', RANGE=0.3, DRY_RUN=1)
+        self.assertFalse(os.path.exists(self.module.results_dir))
+
+    def test_unwritable_result_folder_does_not_break_the_run(self):
+        blocker = os.path.join(tempfile.mkdtemp(), 'file')
+        open(blocker, 'w').close()
+        self.make(results_dir=os.path.join(blocker, 'results'))
+        gcmd = self.scan(T=2, AXES='x', RANGE=0.3)
+        self.assertIn('finished after', gcmd.text)
+        self.assertNotIn('result file', gcmd.text)
+
+    def test_default_folder_is_below_the_config_folder(self):
+        module = dock_autotune.DockAutotune(FakeConfig(FakePrinter(FakeDock(FakeTool(2, 0, 0, 0), {}, WINDOW),
+                                                                   FakeTool(2, 0, 0, 0))))
+        self.assertTrue(os.path.normpath(module.results_dir).endswith(
+            os.path.join('printer_data', 'config', 'dock_autotune', 'results')))
 
     # -- preparation like a print start ---------------------------------------------------
 

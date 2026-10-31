@@ -44,11 +44,21 @@ git clone https://github.com/ChrisFo8390/ktc-dock-autotune.git ~/ktc-dock-autotu
 ~/ktc-dock-autotune/install.sh
 ```
 
-The installer links the module into Klipper, copies `dock_autotune.cfg` (your settings, never overwritten) and
-`dock_autotune_macro.cfg` (updated on every run), adds both `[include ...]` lines to `printer.cfg` (above
-`SAVE_CONFIG`), adds an `[update_manager]` entry to `moonraker.conf` and restarts Klipper (and Moonraker if it changed
-`moonraker.conf`). Backups are made before a file is changed, and running it again changes nothing that is already
-there. `sudo` has to work without a password, otherwise the script prints the command to run.
+The installer links the module into Klipper and puts its files into a folder of your config directory:
+
+```
+printer_data/config/dock_autotune/
+    dock_autotune.cfg          your settings (never overwritten)
+    dock_autotune_macro.cfg    the macro for the macro list (updated on every run)
+    results/                   one result file per run
+```
+
+It adds `[include dock_autotune/dock_autotune.cfg]` and `[include dock_autotune/dock_autotune_macro.cfg]` to
+`printer.cfg` (above `SAVE_CONFIG`), adds an `[update_manager]` entry to `moonraker.conf` and restarts Klipper (and
+Moonraker if it changed `moonraker.conf`). Backups are made before a file is changed, and running it again changes
+nothing that is already there. An older version had both files directly in the config directory: the installer
+moves your settings into the folder and changes the include lines. `sudo` has to work without a password, otherwise
+the script prints the command to run.
 
 | Option | |
 |---|---|
@@ -56,10 +66,11 @@ there. `sudo` has to work without a password, otherwise the script prints the co
 | `--no-macro` | do not install the macro for the macro list |
 | `--no-update-manager` | do not touch `moonraker.conf` |
 | `--no-restart` | do not restart anything |
-| `--uninstall` | remove the link and the include lines (the `.cfg` files and the update manager entry stay) |
+| `--uninstall` | remove the link and the include lines (the folder `dock_autotune/` and the update manager entry stay) |
 | `KLIPPER_PATH=…`, `CONFIG_PATH=…` | other locations than `~/klipper` and `~/printer_data/config` |
 
-Update with `git pull && ./install.sh` in the clone: module and macro file belong together.
+Update with `git pull && ./install.sh` in the clone: module and macro file belong together. (The update manager of
+Mainsail updates the module only; the installer also refreshes the macro file.)
 
 ## Use
 
@@ -69,6 +80,10 @@ DOCK_AUTOTUNE T=1 AXES=z RANGE=0.4      # first run: one axis, small range, watc
 DOCK_AUTOTUNE T=1                       # x, y and z with the configured ranges
 DOCK_AUTOTUNE_INTERRUPT                 # stops after the current trial (M112 stops at once)
 ```
+
+What the command does without further parameters is set in `dock_autotune.cfg`: `mode` (scan or map), `axes`,
+`prepare` (ask, yes, no), `adxl`, `adxl_raw`, the ranges and so on. With `mode: map`, `axes: z` and `prepare: no`
+the ADXL map of the Z axis is `DOCK_AUTOTUNE T=0`. A parameter of the call always wins.
 
 `DOCK_AUTOTUNE` also is in the macro list of Mainsail, with an input field per parameter (see "Macro list").
 
@@ -90,7 +105,7 @@ without a probe, legacy `[scanner]`), the prompt says so and only offers to cont
 hand (`PREPARE=0`). After a preparation the machine stays prepared, so the next run can use `PREPARE=0`.
 
 **Result.** The new values apply until the next restart and are printed as `params_park_x: ...` lines. Copy them into
-`toolchanger/tools/T<n>.cfg`. A failing trial prints a red `Expected tool ... but active is None`: that is expected,
+`toolchanger/tools/T<n>.cfg`. The same numbers are in the result file (see "Result file"). A failing trial prints a red `Expected tool ... but active is None`: that is expected,
 it is how the edge is found. A scan takes at most `2 * range / step` trials per axis plus the edge refinement
 (`DRY_RUN=1` prints the number), each with `repeats` pickups.
 
@@ -129,8 +144,12 @@ shuttle lifts the tool out of the dock it settles into the coupling with a small
 a grid of positions and changes nothing:
 
 ```
-DOCK_AUTOTUNE T=0 MODE=map AXES=z RANGE=1.0 STEP=0.25 REPEATS=3 PREPARE=0
+DOCK_AUTOTUNE T=0 MODE=map AXES=z PREPARE=0 RAW=1
 ```
+
+The grid goes `map_range` (1.5 mm) to both sides of the current position in `map_step` (0.25 mm) steps, with
+`map_repeats` (3) pickups each. Set these once in `dock_autotune.cfg`; `RANGE=`, `STEP=` and `REPEATS=` override them for
+a single call.
 
 For every position (0, +step, -step, +2 step, ...) it does `REPEATS` pickups and dropoffs with the accelerometer
 recording and prints one line per position: how many pickups locked, the strongest knock of the pickup (`peak`, in g),
@@ -138,7 +157,7 @@ its signed components x, y, z at the peak, the time of the peak after the start 
 of the dropoff. Gravity and the smooth acceleration of the moves are removed with a 50 ms high-pass
 (`adxl_window`), so what is left is what happens fast. Values are medians over the repeats. A side of the grid ends
 after `map_fail_stop` failed positions in a row. At the end it names the quietest position and where a component
-changes sign. `RAW=1` also writes the raw samples around the peak of every pickup as CSV to
+changes sign. `RAW=1` (or `adxl_raw: True`) also writes the raw samples around the peak of every pickup as CSV to
 `~/printer_data/logs/dock_autotune_adxl/`.
 
 Whether the knock has a minimum, or a sign change that shows the direction of an error, inside the window has to be
@@ -152,6 +171,22 @@ vertical axis tells how the chip sits (a chip that reads -1 g on z points down).
 With `ADXL=1` a normal scan records the accelerometer too and writes `peak_g` per trial to the log. `abort_g` stops the
 scan when a trial shows a shock above that value.
 
+## Result file
+
+Every run that took measurements writes one text file to `printer_data/config/dock_autotune/results/`, named like
+`T0_map_20261031_194500.txt` (Mainsail: *Machine*, folder `dock_autotune/results`). It holds
+
+* the status of the run (finished, or stopped and why), the settings and the number of pickups,
+* the **park positions** of the tool: before, after and what happened to each axis, and the lines to put into
+  `toolchanger/tools/T<n>.cfg`,
+* for a map the table of the **ADXL measurements** per position, for a scan the trials in the order they were made
+  (with `peak_g` if the accelerometer was on),
+* all numbers once more as CSV, to paste into a spreadsheet.
+
+A run that is stopped writes the file too, with what was measured until then. `results_dir:` in `dock_autotune.cfg`
+changes the folder, an empty value switches the file off. The folder is part of the config directory, so a backup of
+that directory (Klipper backup, git) contains the results as well.
+
 ## Macro list
 
 Mainsail, Fluidd and touch UIs list only `[gcode_macro]` sections, not commands that a module registers.
@@ -164,13 +199,13 @@ it: Mainsail leaves such macros out of its list. Add the macro to a group under 
 | Problem | Check |
 |---|---|
 | Klipper stops: `Existing command 'DOCK_AUTOTUNE' not found` | old macro file with `rename_existing`: `git pull && ./install.sh` |
-| `DOCK_AUTOTUNE` missing in the macro list | `dock_autotune_macro.cfg` included? Reload the page after a restart |
+| `DOCK_AUTOTUNE` missing in the macro list | `dock_autotune/dock_autotune_macro.cfg` included? Reload the page after a restart |
 | No `[update_manager]` entry in Mainsail | restart Moonraker; the clone has to be a Git repository of the printer user; see `moonraker.log` |
 | `ADXL=1` but "no [adxl345 T<n>] section" | name the chips per tool, see "ADXL map" |
 | Scan stops: "does not know the scan mode" | the `error_gcode` pauses: use the handler from `examples/` |
 | Touch homing starts at the height of the dock | `touch_restore_axis: Z` (default) brings Z back after the pickup |
 
-Files written: `~/printer_data/logs/dock_autotune.jsonl` (one line per trial with `tool`, `axis`, `value`, `ok`,
+Files written: the result files (see above) and `~/printer_data/logs/dock_autotune.jsonl` (one line per trial with `tool`, `axis`, `value`, `ok`,
 `peak_g`, `error`, a summary per scan). `printer.dock_autotune` has `active`, `tool`, `axis`, `phase`, `trial`, `result`.
 
 ## Tests

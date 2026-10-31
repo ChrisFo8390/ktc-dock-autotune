@@ -2,9 +2,12 @@
 # KTC Dock Autotune installer
 #
 # Links klipper/extras/dock_autotune.py into Klipper's extras directory, installs the
-# configuration and the macro for the Mainsail macro list, adds both includes to printer.cfg, adds an update manager entry
-# to moonraker.conf and restarts Klipper (and Moonraker, which only reads its config at start).
-# Backups of printer.cfg and moonraker.conf are made before they are changed.
+# configuration and the macro for the Mainsail macro list into <config>/dock_autotune/, adds both includes to
+# printer.cfg, adds an update manager entry to moonraker.conf and restarts Klipper (and Moonraker, which only
+# reads its config at start). The result files of the runs go to <config>/dock_autotune/results/.
+# Backups of printer.cfg and moonraker.conf are made before they are changed. Files of an older version in
+# <config>/ (dock_autotune.cfg with your settings, dock_autotune_macro.cfg) are moved into the folder and the
+# include lines in printer.cfg are changed to match.
 #
 # Usage (from a clone of the repository on the printer):
 #   git clone https://github.com/ChrisFo8390/ktc-dock-autotune.git ~/ktc-dock-autotune
@@ -25,6 +28,7 @@ REPO_URL="https://github.com/ChrisFo8390/ktc-dock-autotune.git"
 REPO_NAME="ktc-dock-autotune"
 KLIPPER_PATH="${KLIPPER_PATH:-${HOME}/klipper}"
 CONFIG_PATH="${CONFIG_PATH:-${HOME}/printer_data/config}"
+CONFIG_DIR="${CONFIG_PATH}/dock_autotune"       # the files of this module: settings, macro, results/
 
 set -eu
 export LC_ALL=C
@@ -128,21 +132,60 @@ function install_config {
         DO_UPDATE_MANAGER="no"
         return
     fi
+    mkdir -p "${CONFIG_DIR}"
+    migrate_old_files
     local name
     for name in ${CONFIG_FILES}; do
         # The macro file has no settings: it is updated with the module (dock_autotune.cfg holds yours)
-        if [ "${name}" = "dock_autotune_macro.cfg" ] && [ -e "${CONFIG_PATH}/${name}" ]                 && ! cmp -s "${INSTALL_PATH}/config/${name}" "${CONFIG_PATH}/${name}"; then
-            backup_file "${CONFIG_PATH}/${name}"
-            cp "${INSTALL_PATH}/config/${name}" "${CONFIG_PATH}/${name}"
-            echo "[INSTALL] Updated ${CONFIG_PATH}/${name}"
-        elif [ ! -e "${CONFIG_PATH}/${name}" ]; then
-            cp "${INSTALL_PATH}/config/${name}" "${CONFIG_PATH}/${name}"
-            echo "[INSTALL] Installed ${CONFIG_PATH}/${name}"
+        if [ "${name}" = "dock_autotune_macro.cfg" ] && [ -e "${CONFIG_DIR}/${name}" ] && ! cmp -s "${INSTALL_PATH}/config/${name}" "${CONFIG_DIR}/${name}"; then
+            backup_file "${CONFIG_DIR}/${name}"
+            cp "${INSTALL_PATH}/config/${name}" "${CONFIG_DIR}/${name}"
+            echo "[INSTALL] Updated ${CONFIG_DIR}/${name}"
+        elif [ ! -e "${CONFIG_DIR}/${name}" ]; then
+            cp "${INSTALL_PATH}/config/${name}" "${CONFIG_DIR}/${name}"
+            echo "[INSTALL] Installed ${CONFIG_DIR}/${name}"
         elif [ "${name}" = "dock_autotune_macro.cfg" ]; then
-            echo "[INFO] ${CONFIG_PATH}/${name} is up to date"
+            echo "[INFO] ${CONFIG_DIR}/${name} is up to date"
         else
-            echo "[INFO] ${CONFIG_PATH}/${name} exists and is not overwritten"
+            echo "[INFO] ${CONFIG_DIR}/${name} exists and is not overwritten"
             echo "[INFO] Compare it with ${INSTALL_PATH}/config/${name} for new settings"
+        fi
+    done
+}
+
+# Versions before the folder kept dock_autotune.cfg and dock_autotune_macro.cfg in the config directory itself.
+# Your settings move into the folder, the old macro file becomes a backup, and the include lines of printer.cfg are
+# changed (two includes of the same section would stop Klipper).
+function migrate_old_files {
+    local cfg="${CONFIG_PATH}/printer.cfg" name old
+    old=""
+    for name in dock_autotune.cfg dock_autotune_macro.cfg; do
+        if [ -f "${CONFIG_PATH}/${name}" ]; then old="${old} ${name}"; fi
+        if [ -f "${cfg}" ] && grep -qE "$(include_pattern "${name}")" "${cfg}"; then old="${old} ${name}"; fi
+    done
+    if [ -z "${old}" ]; then
+        return
+    fi
+    if [ "${DO_INCLUDE}" != "yes" ] || [ ! -f "${cfg}" ]; then
+        echo "[WARNING] Files of an older version are in ${CONFIG_PATH}, but printer.cfg is not changed: move"
+        echo "          dock_autotune.cfg and dock_autotune_macro.cfg into ${CONFIG_DIR} and change the include lines yourself"
+        return
+    fi
+    for name in dock_autotune.cfg dock_autotune_macro.cfg; do
+        if grep -qE "$(include_pattern "${name}")" "${cfg}"; then
+            backup_file "${cfg}"
+            change_include "${name}" "dock_autotune/${name}"
+            echo "[INSTALL] Changed [include ${name}] to [include dock_autotune/${name}] in printer.cfg"
+        fi
+        if [ -f "${CONFIG_PATH}/${name}" ]; then
+            if [ "${name}" = "dock_autotune.cfg" ] && [ ! -e "${CONFIG_DIR}/${name}" ]; then
+                mv "${CONFIG_PATH}/${name}" "${CONFIG_DIR}/${name}"
+                echo "[INSTALL] Moved your ${CONFIG_PATH}/${name} to ${CONFIG_DIR}/${name}"
+            else
+                local backup="${CONFIG_PATH}/${name}.bak.$(date +%Y%m%d%H%M%S)"
+                mv "${CONFIG_PATH}/${name}" "${backup}"
+                echo "[INFO] Old ${CONFIG_PATH}/${name} moved to ${backup}"
+            fi
         fi
     done
 }
@@ -150,6 +193,27 @@ function install_config {
 # Regular expression for the line [include <file>] (a CR at the end of the line is matched by [[:space:]])
 function include_pattern {
     printf '^\[include[[:space:]]+%s\][[:space:]]*$' "${1//./\.}"
+}
+
+# Changes the include line of <old> in printer.cfg to [include <new>], or removes it if <new> is empty. Line by line in
+# bash, so that the CR of Windows line endings stays (sed -i does not always keep it).
+function change_include {
+    local old="$1" new="$2" cfg="${CONFIG_PATH}/printer.cfg" re tmp line
+    re="$(include_pattern "${old}")"
+    tmp="$(mktemp)"
+    while IFS= read -r line || [ -n "${line}" ]; do
+        if [[ "${line}" =~ ${re} ]]; then
+            if [ -n "${new}" ]; then
+                printf '%s
+' "[include ${new}]${line##*]}"
+            fi
+        else
+            printf '%s
+' "${line}"
+        fi
+    done < "${cfg}" > "${tmp}"
+    cat "${tmp}" > "${cfg}"     # not mv: keeps owner and permissions of printer.cfg
+    rm -f "${tmp}"
 }
 
 # Adds [include <file>] to printer.cfg: above the SAVE_CONFIG block if there is one (everything below it
@@ -256,10 +320,10 @@ function uninstall {
     local target="${EXTRAS}/dock_autotune.py"
     local cfg="${CONFIG_PATH}/printer.cfg"
     local name
-    for name in dock_autotune.cfg dock_autotune_macro.cfg; do
+    for name in dock_autotune.cfg dock_autotune_macro.cfg dock_autotune/dock_autotune.cfg dock_autotune/dock_autotune_macro.cfg; do
         if [ -f "${cfg}" ] && grep -qE "$(include_pattern "${name}")" "${cfg}"; then
             backup_file "${cfg}"
-            sed -i -E "/$(include_pattern "${name}")/d" "${cfg}"
+            change_include "${name}" ""
             echo "[UNINSTALL] Removed [include ${name}] from printer.cfg"
         fi
     done
@@ -271,7 +335,7 @@ function uninstall {
     else
         echo "[INFO] ${target} is not installed"
     fi
-    echo "[INFO] Not touched: ${CONFIG_PATH}/dock_autotune*.cfg and the update manager section in moonraker.conf."
+    echo "[INFO] Not touched: ${CONFIG_DIR} (settings, results) and the update manager section in moonraker.conf."
     restart_services
 }
 
@@ -285,6 +349,8 @@ Next steps:
   1. Make sure the error_gcode of your toolchanger leaves the dock after a failed pickup and does not
      pause while a scan runs, see ${INSTALL_PATH}/examples/toolchanger-error-handler.cfg
   2. Try:  DOCK_AUTOTUNE T=1 DRY_RUN=1
+Settings: ${CONFIG_DIR}/dock_autotune.cfg
+Results:  ${CONFIG_DIR}/results/
 Documentation: ${INSTALL_PATH}/README.md
 EOF
 }
@@ -301,9 +367,9 @@ fi
 check_download
 link_module
 install_config
-add_include dock_autotune.cfg
+add_include dock_autotune/dock_autotune.cfg
 if [ "${DO_MACRO}" = "yes" ]; then
-    add_include dock_autotune_macro.cfg
+    add_include dock_autotune/dock_autotune_macro.cfg
 fi
 add_update_manager
 restart_services
