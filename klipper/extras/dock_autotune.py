@@ -583,7 +583,7 @@ def build_plan(setup, bed, soak, touch_cmd, touch_tool, touch_temp, touch_repeat
         # does not start at the height of the dock
         plan.append("SELECT_TOOL T=%d RESTORE_AXIS=%s" % (touch_tool, touch_restore.strip().upper() or "''"))
         if touch_temp > 0:
-            plan.append('M104 S%g' % touch_temp)
+            plan.append('M109 S%g' % touch_temp)       # heat up and wait first, the brush works on a hot nozzle
         plan.extend(before_touch)
         if touch_temp > 0:
             plan.append('M109 S%g' % touch_temp)
@@ -680,7 +680,7 @@ class DockAutotune:
         self.touch_command = config.get('touch_command', 'auto').strip()
         self.touch_tool = config.getint('touch_tool', 0, minval=0)
         self.touch_temp = config.getfloat('touch_temp', 150., minval=0.)
-        self.touch_repeats = config.getint('touch_repeats', 2, minval=1)
+        self.touch_repeats = config.getint('touch_repeats', 1, minval=1)
         self.touch_restore = config.get('touch_restore_axis', 'Z')
         self.before_touch = [l.strip() for l in config.get('before_touch', '').splitlines() if l.strip()]
         # Accelerometer of the tool: "adxl345 T{tool}" (the section must be named per tool)

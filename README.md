@@ -94,9 +94,9 @@ and the steps; **Prepare and start** runs them (bed temperature 70 °C by defaul
 
 1. `INITIALIZE_TOOLCHANGER`, a tool on the shuttle goes back into its dock
 2. `M190` (bed), `G28`, `QUAD_GANTRY_LEVEL` (or `Z_TILT_ADJUST`), `BED_MESH_CLEAR`
-3. touch homing with `touch_tool` (T0 by default, picked up with `SELECT_TOOL`, so AFC is not involved): nozzle heats to
-   `touch_temp` while `before_touch` runs (**put your brush macro there**), then the touch command runs
-   `touch_repeats` times, the nozzle is turned off and the tool goes back into its dock. Without a touch homing the Z
+3. touch homing with `touch_tool` (T0 by default, picked up with `SELECT_TOOL`, so AFC is not involved): the nozzle heats to
+   `touch_temp` (`M109`), `before_touch` runs (**put your brush macro there**), the temperature is waited for again,
+   then the touch command runs `touch_repeats` times (once by default), the nozzle is turned off and the tool goes back into its dock. Without a touch homing the Z
    zero is taken with `G28 Z` after the levelling.
 
 Detected are Cartographer (`CARTOGRAPHER_TOUCH_HOME`), Beacon (`home_method: contact`, touch is `G28 Z`), eddy current

@@ -261,8 +261,14 @@ class PlanTests(unittest.TestCase):
         plan = plan_of(setup, before=('BRUSH',))
         self.assertEqual(plan, [
             'INITIALIZE_TOOLCHANGER', dock_autotune.EMPTY_SHUTTLE, 'M190 S70', 'G28', 'QUAD_GANTRY_LEVEL',
-            'BED_MESH_CLEAR', "SELECT_TOOL T=0 RESTORE_AXIS=Z", 'M104 S150', 'BRUSH', 'M109 S150',
+            'BED_MESH_CLEAR', "SELECT_TOOL T=0 RESTORE_AXIS=Z", 'M109 S150', 'BRUSH', 'M109 S150',
             'CARTOGRAPHER_TOUCH_HOME', 'CARTOGRAPHER_TOUCH_HOME', 'M104 S0', "UNSELECT_TOOL RESTORE_AXIS=''"])
+
+    def test_touch_homing_once(self):
+        plan = plan_of(detect_setup(CARTO, TOUCH), before=('AFC_Brush',), repeats=1)
+        self.assertEqual(plan[plan.index("SELECT_TOOL T=0 RESTORE_AXIS=Z"):],
+                         ["SELECT_TOOL T=0 RESTORE_AXIS=Z", 'M109 S150', 'AFC_Brush', 'M109 S150',
+                          'CARTOGRAPHER_TOUCH_HOME', 'M104 S0', "UNSELECT_TOOL RESTORE_AXIS=''"])
 
     def test_without_touch_the_z_reference_is_taken_again_after_levelling(self):
         plan = plan_of(detect_setup(CARTO, set()), touch=None)
@@ -1022,12 +1028,11 @@ class CommandTests(unittest.TestCase):
         self.dock.homed = False
         gcmd = self.scan(T=2, AXES='z', RANGE=0.8, PREPARE=1, BED=75)
         self.assertNotIn('STOPPED', gcmd.text)
-        self.assertEqual(self.dock.scripts[:13], [
+        self.assertEqual(self.dock.scripts[:12], [
             'INITIALIZE_TOOLCHANGER', 'M190 S75', 'G28', 'QUAD_GANTRY_LEVEL', 'BED_MESH_CLEAR',
-            "SELECT_TOOL T=0 RESTORE_AXIS=Z", 'M104 S150', 'M109 S150', 'CARTOGRAPHER_TOUCH_HOME',
-            'CARTOGRAPHER_TOUCH_HOME', 'M104 S0', "UNSELECT_TOOL RESTORE_AXIS=''",
-            'SET_VELOCITY_LIMIT ACCEL=2000'])
-        self.assertTrue(self.dock.scripts[13].startswith('SELECT_TOOL T=2'))
+            "SELECT_TOOL T=0 RESTORE_AXIS=Z", 'M109 S150', 'M109 S150', 'CARTOGRAPHER_TOUCH_HOME',
+            'M104 S0', "UNSELECT_TOOL RESTORE_AXIS=''", 'SET_VELOCITY_LIMIT ACCEL=2000'])
+        self.assertTrue(self.dock.scripts[12].startswith('SELECT_TOOL T=2'))
         self.assertAlmostEqual(self.tool.params['params_park_z'], self.centre('z'), places=3)
         self.assertEqual((self.dock.mounted, self.dock.status), (-1, 'ready'))
 
@@ -1066,20 +1071,21 @@ class CommandTests(unittest.TestCase):
         self.assertIn('G28 Z', self.dock.scripts)
 
     def test_touch_settings_from_the_config(self):
-        self.make(touch_temp='148', touch_repeats='1', before_touch='BRUSH')
+        self.make(touch_temp='148', touch_repeats='2', before_touch='BRUSH')
         self.carto()
         self.scan(T=2, AXES='z', RANGE=0.3, PREPARE=1)
-        self.assertEqual(self.dock.scripts[5:11], ["SELECT_TOOL T=0 RESTORE_AXIS=Z", 'M104 S148', 'BRUSH',
-                                                   'M109 S148', 'CARTOGRAPHER_TOUCH_HOME', 'M104 S0'])
+        self.assertEqual(self.dock.scripts[5:12], ["SELECT_TOOL T=0 RESTORE_AXIS=Z", 'M109 S148', 'BRUSH',
+                                                   'M109 S148', 'CARTOGRAPHER_TOUCH_HOME', 'CARTOGRAPHER_TOUCH_HOME',
+                                                   'M104 S0'])
 
     def test_beacon_contact_homing_is_the_touch(self):
         self.make()
         self.carto({'stepper_z': {'endstop_pin': 'probe:z_virtual_endstop'}, 'beacon': {'home_method': 'contact'},
                     'z_tilt': {}}, commands=())
         self.scan(T=2, AXES='z', RANGE=0.3, PREPARE=1)
-        self.assertEqual(self.dock.scripts[:9], ['INITIALIZE_TOOLCHANGER', 'G28', 'Z_TILT_ADJUST',
-                                                 "SELECT_TOOL T=0 RESTORE_AXIS=Z", 'M104 S150', 'M109 S150',
-                                                 'G28 Z', 'G28 Z', 'M104 S0'])
+        self.assertEqual(self.dock.scripts[:8], ['INITIALIZE_TOOLCHANGER', 'G28', 'Z_TILT_ADJUST',
+                                                 "SELECT_TOOL T=0 RESTORE_AXIS=Z", 'M109 S150', 'M109 S150',
+                                                 'G28 Z', 'M104 S0'])
 
     def test_failure_in_the_preparation_stops_with_a_report(self):
         self.make()
