@@ -66,7 +66,7 @@ class MacroTests(unittest.TestCase):
         # Mainsail makes an input field of every params.<NAME> in the macro
         gcode = read_macro()['gcode']
         for name in ('T', 'AXES', 'RANGE', 'STEP', 'REPEATS', 'SPEED', 'BED', 'SOAK', 'PREPARE', 'TOUCH', 'ADXL',
-                     'DRY_RUN'):
+                     'MODE', 'RAW', 'DRY_RUN'):
             self.assertIn('params.%s' % name, gcode)
 
 

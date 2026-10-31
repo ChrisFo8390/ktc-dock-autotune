@@ -31,7 +31,7 @@ import os
 import time
 
 AXES = 'xyz'
-FREEFALL = 9.80665          # m/s^2, Klipper reports accelerometer samples in m/s^2
+FREEFALL = 9806.65          # mm/s^2 = 1 g, Klipper reports accelerometer samples in mm/s^2
 RESTORE_NONE = "RESTORE_AXIS=''"   # no position restore: the scan does not need the old position
 
 
@@ -91,7 +91,7 @@ def window_center(edges):
 
 def shock_metrics(samples):
     """
-    Shock numbers of accelerometer samples [(time, x, y, z), ...] in m/s^2, in g.
+    Shock numbers of accelerometer samples [(time, x, y, z), ...] in mm/s^2, in g.
     The static part (gravity, orientation) is the median of each axis over the samples.
     peak_dev_g:   largest deviation from that median
     peak_delta_g: largest change between two consecutive samples (a knock, not a tilt)
@@ -107,6 +107,109 @@ def shock_metrics(samples):
     return {'samples': len(samples), 'peak_dev_g': round(max(dev), 3),
             'peak_delta_g': round(max(delta), 3),
             'rms_g': round(math.sqrt(sum(d * d for d in dev) / len(dev)), 3)}
+
+
+# ---------------------------------------------------------------------------
+# ADXL map: what the accelerometer of the tool sees while it is picked up (pure, used by the tests)
+# ---------------------------------------------------------------------------
+
+def residuals(samples, window=0.05):
+    """
+    Samples [(time, x, y, z), ...] in mm/s^2 -> (times, rate in Hz, [rx, ry, rz]) in g with the slow part
+    removed: gravity, tilt and the smooth acceleration of the moves are the moving mean over `window` seconds,
+    what is left is what happens fast (a knock, the click of the coupling).
+    """
+    n = len(samples)
+    times = [s[0] for s in samples]
+    rate = (n - 1) / (times[-1] - times[0]) if n > 1 and times[-1] > times[0] else 0.0
+    half = max(1, int(round(rate * window)) // 2)
+    columns = []
+    for axis in (1, 2, 3):
+        values = [s[axis] / FREEFALL for s in samples]
+        prefix = [0.0]
+        for v in values:
+            prefix.append(prefix[-1] + v)
+        out = []
+        for i, v in enumerate(values):
+            lo, hi = max(0, i - half), min(n, i + half + 1)
+            out.append(v - (prefix[hi] - prefix[lo]) / (hi - lo))
+        columns.append(out)
+    return times, rate, columns
+
+
+def knock_metrics(samples, t_from, t_to, window=0.05):
+    """
+    The strongest knock of the samples between t_from and t_to: peak (g, length of the residual vector), its
+    time in s after t_from and its signed components x, y, z in g (axes of the chip after axes_map), the RMS of
+    the residual and the sample rate. None if there are too few samples.
+    """
+    part = [s for s in samples if t_from <= s[0] <= t_to]
+    if len(part) < 20:
+        return None
+    times, rate, (rx, ry, rz) = residuals(part, window)
+    norms = [math.sqrt(a * a + b * b + c * c) for a, b, c in zip(rx, ry, rz)]
+    i = max(range(len(norms)), key=norms.__getitem__)
+    return {'n': len(part), 'rate_hz': round(rate), 'peak_g': round(norms[i], 3), 't_peak': round(times[i] - t_from, 3),
+            'x': round(rx[i], 3), 'y': round(ry[i], 3), 'z': round(rz[i], 3),
+            'rms_g': round(math.sqrt(sum(v * v for v in norms) / len(norms)), 4)}
+
+
+def csv_snippet(samples, t_from, t_to, t_peak, half=0.25, window=0.05):
+    """CSV lines (time after t_from, raw x, y, z in g, residual x, y, z in g) around the peak"""
+    part = [s for s in samples if t_from <= s[0] <= t_to]
+    if len(part) < 20:
+        return []
+    times, _, (rx, ry, rz) = residuals(part, window)
+    lines = ['time_s,x_g,y_g,z_g,res_x_g,res_y_g,res_z_g']
+    for i, s in enumerate(part):
+        if abs(times[i] - t_from - t_peak) <= half:
+            lines.append('%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f' % (
+                times[i] - t_from, s[1] / FREEFALL, s[2] / FREEFALL, s[3] / FREEFALL, rx[i], ry[i], rz[i]))
+    return lines
+
+
+def median(values):
+    values = sorted(values)
+    n = len(values)
+    if n == 0:
+        return None
+    return values[n // 2] if n % 2 else (values[n // 2 - 1] + values[n // 2]) / 2.0
+
+
+def zero_crossings(rows, key):
+    """Offsets at which the median component `key` of the map changes sign (linear between two positions)"""
+    points = [(r['offset'], r['pick'][key]) for r in rows if r['ok'] and r.get('pick')]
+    points.sort()
+    found = []
+    for (o1, v1), (o2, v2) in zip(points, points[1:]):
+        if v1 * v2 < 0:
+            found.append(round(o1 + (o2 - o1) * v1 / (v1 - v2), 3))
+    return found
+
+
+def map_table(tool, axis, rows, window):
+    """The map of one axis as text lines. rows: offset, value, locked, total, ok, pick, drop"""
+    lines = ["ADXL map T%d %s: knock in g after a %d ms high-pass, signed components at the peak of the pickup "
+             "(median of the repeats; x y z are the axes of the chip after axes_map)" % (
+                 tool, axis.upper(), int(round(window * 1000))),
+             " offset      value  locked   pickup      x      y      z  t_peak  dropoff"]
+    for r in sorted(rows, key=lambda r: r['offset']):
+        pick, drop = r.get('pick'), r.get('drop')
+        lines.append("%+7.2f  %9.3f  %d/%d    %s  %s" % (
+            r['offset'], r['value'], r['locked'], r['total'],
+            ("%7.3f %6.2f %6.2f %6.2f %6.2f s" % (pick['peak_g'], pick['x'], pick['y'], pick['z'], pick['t_peak'])
+             if pick else "      -      -      -      -       -"),
+            ("%7.3f" % drop['peak_g']) if drop else "      -"))
+    good = [r for r in rows if r['ok'] and r.get('pick')]
+    if good:
+        quiet = min(good, key=lambda r: r['pick']['peak_g'])
+        lines.append("Quietest pickup: %+.2f mm (%.3f g)" % (quiet['offset'], quiet['pick']['peak_g']))
+        for key in 'xyz':
+            crossings = zero_crossings(rows, key)
+            if crossings:
+                lines.append("Component %s changes sign at %s mm" % (key, ', '.join('%+.2f' % c for c in crossings)))
+    lines.append("Nothing is changed by a map. Locked = pickups that locked / tried.")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -290,11 +393,19 @@ class DockAutotune:
         # Accelerometer of the tool: "adxl345 T{tool}" (the section must be named per tool)
         self.accel_chip = config.get('accelerometer', 'adxl345 T{tool}')
         self.abort_g = config.getfloat('abort_g', 0., minval=0.)
+        # ADXL map (MODE=map): high-pass window of the knock metric, step and repeats of the grid, how many
+        # failed positions in a row end one side of the grid
+        self.adxl_window = config.getfloat('adxl_window', 0.05, above=0.)
+        self.map_step = config.getfloat('map_step', 0.25, above=0.)
+        self.map_repeats = config.getint('map_repeats', 3, minval=1)
+        self.map_fail_stop = config.getint('map_fail_stop', 2, minval=1)
         self.log_file = os.path.expanduser(
             config.get('log_file', '~/printer_data/logs/dock_autotune.jsonl'))
         self.active = False
         self.abort = False
         self.use_adxl = False
+        self.last_samples = None        # accelerometer samples of the last cycle, and when its pickup ended
+        self.last_pick_end = None
         self.state = {'tool': None, 'axis': None, 'phase': 'idle', 'trial': 0, 'message': ''}
         self.result = {}
         self.cycles = 0
@@ -362,11 +473,13 @@ class DockAutotune:
             return None
 
     def _adxl_finish(self, client):
+        self.last_samples = None
         if client is None:
             return None
         try:
             client.finish_measurements()
-            return shock_metrics(client.get_samples())
+            self.last_samples = client.get_samples()
+            return shock_metrics(self.last_samples)
         except Exception:
             logging.exception("dock_autotune: accelerometer read failed")
             return None
@@ -436,6 +549,7 @@ class DockAutotune:
         if self.cycles > self.max_cycles:
             raise AbortScan('max_cycles (%d) reached' % self.max_cycles)
         client = self._adxl_start(tool_number)
+        self.last_pick_end = None
         picked, error = True, ''
         try:
             self._run("SELECT_TOOL T=%d %s" % (tool_number, RESTORE_NONE))
@@ -446,6 +560,11 @@ class DockAutotune:
             picked = status['status'] == 'ready' and status['tool_number'] == tool_number
             error = '' if picked else 'toolchanger %s, tool %s' % (status['status'], status['tool_number'])
         if picked:
+            if client is not None:
+                # where the pickup ends and the dropoff begins, for the ADXL map
+                toolhead = self.printer.lookup_object('toolhead')
+                toolhead.wait_moves()
+                self.last_pick_end = toolhead.get_last_move_time()
             # An error while the tool is put back is not a trial result: the scan stops
             self._run("UNSELECT_TOOL %s" % RESTORE_NONE)
             self._wait()
@@ -547,12 +666,98 @@ class DockAutotune:
                                       % (number, axis.upper()))
         return base, result
 
+    # -- the ADXL map ---------------------------------------------------------------
+
+    def _map_cycle(self, tool_number):
+        """One pickup and dropoff with the accelerometer. Returns (picked, error, pickup knock, dropoff knock,
+        csv lines of the pickup)"""
+        picked, error, _ = self._cycle(tool_number)
+        samples = self.last_samples
+        if not samples:
+            return picked, error, None, None, []
+        start, end = samples[0][0], samples[-1][0]
+        mid = self.last_pick_end if (picked and self.last_pick_end is not None) else end
+        pick = knock_metrics(samples, start, mid, self.adxl_window)
+        drop = knock_metrics(samples, mid, end, self.adxl_window) if picked else None
+        snippet = csv_snippet(samples, start, mid, pick['t_peak'], window=self.adxl_window) if pick else []
+        return picked, error, pick, drop, snippet
+
+    def _map_trial(self, tool, axis, offset, base, repeats, raw):
+        """Set the park value and take `repeats` pickups with the accelerometer"""
+        value = round(base + offset, 4)
+        tool.set_parameter('params_park_%s' % axis, value)
+        self.state['trial'] += 1
+        picks, drops, locked, error = [], [], 0, ''
+        for repeat in range(repeats):
+            picked, error, pick, drop, snippet = self._map_cycle(tool.tool_number)
+            if picked:
+                locked += 1
+            if pick:
+                picks.append(pick)
+            if drop:
+                drops.append(drop)
+            if raw and snippet:
+                self._save_snippet(tool.tool_number, axis, offset, repeat + 1, snippet)
+            if not picked:
+                break
+        row = {'offset': round(offset, 4), 'value': value, 'locked': locked, 'total': repeats,
+               'ok': locked == repeats, 'error': error, 'pick': None, 'drop': None}
+        for name, items in (('pick', picks), ('drop', drops)):
+            if items:
+                row[name] = {key: round(median([i[key] for i in items]), 3)
+                             for key in ('peak_g', 'x', 'y', 'z', 't_peak', 'rms_g')}
+        return row
+
+    def _save_snippet(self, number, axis, offset, repeat, lines):
+        folder = os.path.join(os.path.dirname(self.log_file), 'dock_autotune_adxl')
+        try:
+            os.makedirs(folder, exist_ok=True)
+            name = 'T%d_%s_%+.3f_r%d_pickup.csv' % (number, axis, offset, repeat)
+            with open(os.path.join(folder, name), 'w') as f:
+                f.write('\n'.join(lines) + '\n')
+        except OSError:
+            logging.exception("dock_autotune: cannot write the ADXL snippet")
+
+    def _map_tool(self, gcmd, tool, axes, limits, step, repeats, raw):
+        """Map the knock of the pickup over a grid of positions: 0, +step, -step, +2 step, ... Positions beyond
+        `map_fail_stop` failed ones in a row on one side are skipped. Nothing is applied."""
+        number = tool.tool_number
+        base = {a: float(tool.params['params_park_%s' % a]) for a in axes}
+        result = {}
+        for axis in axes:
+            self._check_abort()
+            self.state['axis'] = axis
+            self.state['phase'] = 'map %s' % axis
+            steps = int(limits[axis] / step + 1e-9)
+            order = [0.0]
+            for k in range(1, steps + 1):
+                order.extend([round(k * step, 6), round(-k * step, 6)])
+            rows, fails, stopped = [], {1: 0, -1: 0}, {1: False, -1: False}
+            for offset in order:
+                sign = 1 if offset > 0 else -1
+                if offset != 0 and stopped[sign]:
+                    continue
+                self._check_abort()
+                row = self._map_trial(tool, axis, offset, base[axis], repeats, raw)
+                rows.append(row)
+                self._log({'tool': number, 'axis': axis, 'map': row})
+                if offset == 0 and not row['ok']:
+                    raise AbortScan("baseline %s=%.3f does not work (tool not in its dock, or the dock must be "
+                                    "adjusted by hand first)" % (axis.upper(), base[axis]))
+                if offset != 0:
+                    fails[sign] = 0 if row['ok'] else fails[sign] + 1
+                    stopped[sign] = fails[sign] >= self.map_fail_stop
+            tool.set_parameter('params_park_%s' % axis, base[axis])
+            result[axis] = rows
+            gcmd.respond_info('\n'.join(map_table(number, axis, rows, self.adxl_window)))
+        return base, result
+
     # -- commands -------------------------------------------------------------------
 
     cmd_DOCK_AUTOTUNE_help = ("Find the window in which a tool locks and centre its dock position: "
                               "DOCK_AUTOTUNE T=N [AXES=xyz] [STEP=0.1] [RANGE=MM] [REPEATS=2] "
-                              "[RESOLUTION=0.05] [SPEED=0.5] [ADXL=1] [PREPARE=0|1] [BED=70] [SOAK=SECONDS] "
-                              "[TOUCH=0] [DRY_RUN=1]")
+                              "[RESOLUTION=0.05] [SPEED=0.5] [ADXL=1] [MODE=scan|map] [RAW=1] [PREPARE=0|1] "
+                              "[BED=70] [SOAK=SECONDS] [TOUCH=0] [DRY_RUN=1]")
 
     def cmd_DOCK_AUTOTUNE(self, gcmd):
         if self.active:
@@ -561,17 +766,24 @@ class DockAutotune:
         axes = ''.join(a for a in gcmd.get('AXES', 'xyz').lower() if a in AXES)
         if not axes:
             raise gcmd.error("AXES must contain x, y or z")
-        step = gcmd.get_float('STEP', self.step, above=0.)
+        mode_map = gcmd.get('MODE', 'scan').strip().lower() == 'map'
+        step = gcmd.get_float('STEP', self.map_step if mode_map else self.step, above=0.)
         resolution = gcmd.get_float('RESOLUTION', self.resolution, above=0.)
         limits = dict(self.range)
         if gcmd.get('RANGE', None) is not None:
             limits = {a: gcmd.get_float('RANGE', above=0.) for a in AXES}
         for a in AXES:
             limits[a] = gcmd.get_float('RANGE_%s' % a.upper(), limits[a], above=0.)
-        repeats = gcmd.get_int('REPEATS', self.repeats, minval=1)
+        repeats = gcmd.get_int('REPEATS', self.map_repeats if mode_map else self.repeats, minval=1)
         speed = gcmd.get_float('SPEED', self.speed_factor, above=0., maxval=1.)
-        self.use_adxl = gcmd.get_int('ADXL', 0) == 1
+        mode = gcmd.get('MODE', 'scan').strip().lower()
+        if mode not in ('scan', 'map'):
+            raise gcmd.error("MODE must be scan or map")
+        raw = gcmd.get_int('RAW', 0) == 1
+        self.use_adxl = gcmd.get_int('ADXL', 0) == 1 or mode == 'map'
         if self.use_adxl and self.printer.lookup_object(self.accel_chip.format(tool=number), None) is None:
+            if mode == 'map':
+                raise gcmd.error("DOCK_AUTOTUNE: MODE=map needs the accelerometer [%s]" % self.accel_chip.format(tool=number))
             gcmd.respond_info("dock_autotune: ADXL=1 but there is no [%s] section - scanning without the "
                               "accelerometer" % self.accel_chip.format(tool=number))
         dry_run = gcmd.get_int('DRY_RUN', 0) == 1
@@ -611,10 +823,14 @@ class DockAutotune:
 
         per_axis = {a: int(limits[a] / step + 1e-9) for a in axes}
         bisect = max(0, int(math.ceil(math.log(step / resolution, 2) - 1e-9))) if self.refine else 0
-        trials = sum(2 * n + 2 * bisect + 2 for n in per_axis.values())
-        gcmd.respond_info("dock_autotune T%d, axes %s, step %.3f mm, range %s, %d repeat(s): about %d trials "
+        if mode == 'map':
+            trials = sum(2 * n + 1 for n in per_axis.values())
+        else:
+            trials = sum(2 * n + 2 * bisect + 2 for n in per_axis.values())
+        gcmd.respond_info("dock_autotune T%d %s, axes %s, step %.3f mm, range %s, %d repeat(s): about %d trials "
                           "(%d pickups) at most, current dock position x=%.3f y=%.3f z=%.3f"
-                          % (number, axes.upper(), step, ' '.join('%s+/-%.2f' % (a, limits[a]) for a in axes),
+                          % (number, 'ADXL map' if mode == 'map' else 'scan', axes.upper(), step,
+                             ' '.join('%s+/-%.2f' % (a, limits[a]) for a in axes),
                              repeats, trials, trials * repeats,
                              *[float(tool.params['params_park_%s' % a]) for a in 'xyz']))
         if dry_run:
@@ -640,10 +856,19 @@ class DockAutotune:
             if self._tc_status()['tool_number'] == number:
                 self._run("UNSELECT_TOOL %s" % RESTORE_NONE)
                 self._wait()
-            base, result = self._scan_tool(gcmd, tool, axes, limits, step, resolution)
-            proposals = {a: base[a] for a in axes if result[a]['proposal'] is not None}
-            self.result = {'tool': number, 'axes': result}
-            self._finish_ok(gcmd, number, originals, proposals, result)
+            if mode == 'map':
+                base, result = self._map_tool(gcmd, tool, axes, limits, step, repeats, raw)
+                self.result = {'tool': number, 'map': result}
+                gcmd.respond_info("dock_autotune T%d ADXL map finished after %d pickups, the park values are "
+                                  "unchanged%s" % (number, self.cycles,
+                                                   ", CSV snippets in %s" % os.path.join(
+                                                       os.path.dirname(self.log_file), 'dock_autotune_adxl')
+                                                   if raw else ""))
+            else:
+                base, result = self._scan_tool(gcmd, tool, axes, limits, step, resolution)
+                proposals = {a: base[a] for a in axes if result[a]['proposal'] is not None}
+                self.result = {'tool': number, 'axes': result}
+                self._finish_ok(gcmd, number, originals, proposals, result)
         except AbortScan as e:
             self._abort_report(gcmd, number, e)
         except self.gcode.error as e:

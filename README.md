@@ -18,7 +18,7 @@ and puts `params_park_x/y/z` of the tool in the middle of it:
 3. The centre of the window is tried again and, if it locks, applied. Axes are done one after the other.
 
 The scan runs in the coordinate frame of a real tool change, so the values are valid for printing. The signal is the
-tool detection pin. An accelerometer on the tool can be recorded alongside (see "Accelerometer").
+tool detection pin. An accelerometer on the tool can show how hard the tool seats at each position (see "ADXL map").
 
 If no trial fails on a side within `range_*`, there is no edge: the window is *not closed* and that axis is left
 alone. The message says how wide the window is at least. Run it again with a larger range and step, for example
@@ -102,7 +102,8 @@ it is how the edge is found. A scan takes at most `2 * range / step` trials per 
 | `REPEATS`, `SPEED` | pickups per candidate, factor on `params_path_speed` while scanning |
 | `PREPARE=1\|0` | prepare first and scan / the machine is prepared; no prompt |
 | `BED`, `SOAK`, `TOUCH=0` | bed temperature (°C), extra wait (s), no touch homing |
-| `ADXL=1` | record the accelerometer of the tool |
+| `ADXL=1` | record the accelerometer of the tool during a scan (`peak_g` in the log) |
+| `MODE=map`, `RAW=1` | ADXL map instead of a scan, with CSV snippets (see "ADXL map") |
 | `DRY_RUN=1` | only print the plan |
 
 All options with their defaults are in [`config/dock_autotune.cfg`](config/dock_autotune.cfg).
@@ -121,12 +122,35 @@ Does the dock position depend on the bed temperature? Scan the same dock at `BED
 * The scan uses `SELECT_TOOL`/`UNSELECT_TOOL`, not the `T<n>` commands. AFC is not asked to load anything but sees
   the extruder activations. Check that AFC and the toolchanger agree about the tool before the next print.
 
-## Accelerometer (optional)
+## ADXL map (optional)
 
-`ADXL=1` records the accelerometer of the tool during every pickup and dropoff and writes `peak_g` (largest deviation
-from the median, in g) to the log. The chips have to be named per tool, `[adxl345 T0]` ... `[adxl345 T4]` (an unnamed
-`[adxl345]` in several files is merged into one chip). `abort_g` stops the scan when a trial shows a shock above that
-value. Whether the shock tells a good position from a worse one inside the window has to be seen on the machine.
+The detection pin only says "locked" or "not locked". The accelerometer on the tool also sees *how* it seats: when the
+shuttle lifts the tool out of the dock it settles into the coupling with a small knock. `MODE=map` shows that knock for
+a grid of positions and changes nothing:
+
+```
+DOCK_AUTOTUNE T=0 MODE=map AXES=z RANGE=1.0 STEP=0.25 REPEATS=3 PREPARE=0
+```
+
+For every position (0, +step, -step, +2 step, ...) it does `REPEATS` pickups and dropoffs with the accelerometer
+recording and prints one line per position: how many pickups locked, the strongest knock of the pickup (`peak`, in g),
+its signed components x, y, z at the peak, the time of the peak after the start of the pickup, and the strongest knock
+of the dropoff. Gravity and the smooth acceleration of the moves are removed with a 50 ms high-pass
+(`adxl_window`), so what is left is what happens fast. Values are medians over the repeats. A side of the grid ends
+after `map_fail_stop` failed positions in a row. At the end it names the quietest position and where a component
+changes sign. `RAW=1` also writes the raw samples around the peak of every pickup as CSV to
+`~/printer_data/logs/dock_autotune_adxl/`.
+
+Whether the knock has a minimum, or a sign change that shows the direction of an error, inside the window has to be
+seen on the machine: with a self-centring coupling it may be flat. The map is for looking at that, nothing is applied.
+
+Requirements: the chips named per tool, `[adxl345 T0]` ... `[adxl345 T4]` (an unnamed `[adxl345]` in several files is
+merged into one chip). The components are in the axes of the chip after `axes_map`; the sign of gravity on the
+vertical axis tells how the chip sits (a chip that reads -1 g on z points down). Test a chip with
+`ACCELEROMETER_QUERY CHIP=T0`. Klipper reports mm/s², the module converts to g (1 g = 9806.65 mm/s²).
+
+With `ADXL=1` a normal scan records the accelerometer too and writes `peak_g` per trial to the log. `abort_g` stops the
+scan when a trial shows a shock above that value.
 
 ## Macro list
 
@@ -142,7 +166,7 @@ it: Mainsail leaves such macros out of its list. Add the macro to a group under 
 | Klipper stops: `Existing command 'DOCK_AUTOTUNE' not found` | old macro file with `rename_existing`: `git pull && ./install.sh` |
 | `DOCK_AUTOTUNE` missing in the macro list | `dock_autotune_macro.cfg` included? Reload the page after a restart |
 | No `[update_manager]` entry in Mainsail | restart Moonraker; the clone has to be a Git repository of the printer user; see `moonraker.log` |
-| `ADXL=1` but "no [adxl345 T<n>] section" | name the chips per tool, see "Accelerometer" |
+| `ADXL=1` but "no [adxl345 T<n>] section" | name the chips per tool, see "ADXL map" |
 | Scan stops: "does not know the scan mode" | the `error_gcode` pauses: use the handler from `examples/` |
 | Touch homing starts at the height of the dock | `touch_restore_axis: Z` (default) brings Z back after the pickup |
 

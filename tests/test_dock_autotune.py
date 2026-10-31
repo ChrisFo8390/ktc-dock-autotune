@@ -7,8 +7,9 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, 'klipper', 'extras'))
 
 import dock_autotune  # noqa: E402
-from dock_autotune import (build_plan, build_prompt, command_line, detect_setup, scan_axis,  # noqa: E402
-                           shock_metrics, window_center)
+from dock_autotune import (build_plan, build_prompt, command_line, csv_snippet, detect_setup,  # noqa: E402
+                           knock_metrics, map_table, median, scan_axis, shock_metrics, window_center,
+                           zero_crossings)
 
 
 # --- pure helpers ----------------------------------------------------------
@@ -95,6 +96,102 @@ class ShockMetricsTests(unittest.TestCase):
         m = shock_metrics(self.samples([1.0 + 0.01 * i for i in range(100)]))
         self.assertLess(m['peak_delta_g'], 0.02)
         self.assertGreater(m['peak_dev_g'], 0.4)
+
+
+# --- ADXL map (pure) -----------------------------------------------------------------
+
+G = dock_autotune.FREEFALL
+
+
+def gravity_samples(seconds=2.0, rate=1000, knock_at=None, knock=(0.0, 0.0, 0.0), ramp=0.0, t0=0.0):
+    """Samples in mm/s^2: -1 g on z (the chip is upside down), a slow ramp on x, one knock (g) at a time"""
+    out = []
+    for i in range(int(seconds * rate)):
+        t = i / rate
+        x, y, z = ramp * t, 0.0, -1.0
+        if knock_at is not None and abs(t - knock_at) < 0.5 / rate:
+            x, y, z = x + knock[0], y + knock[1], z + knock[2]
+        out.append((t0 + t, x * G, y * G, z * G))
+    return out
+
+
+class KnockMetricsTests(unittest.TestCase):
+    def test_a_g_is_9806_65_mm_per_s2(self):
+        # Klipper reports mm/s^2: 1 g is 9806.65, not 9.80665
+        self.assertAlmostEqual(G, 9806.65)
+        metrics = shock_metrics([(i * 0.001, 0.0, 0.0, -G * (1 + (i == 30))) for i in range(60)])
+        self.assertAlmostEqual(metrics['peak_dev_g'], 1.0, places=2)
+
+    def test_gravity_and_slow_motion_are_not_a_knock(self):
+        metrics = knock_metrics(gravity_samples(ramp=0.2), 0.0, 2.0)
+        self.assertLess(metrics['peak_g'], 0.01)
+
+    def test_finds_the_knock_with_time_and_signed_components(self):
+        metrics = knock_metrics(gravity_samples(knock_at=1.0, knock=(0.3, -0.1, 0.5)), 0.0, 2.0)
+        self.assertAlmostEqual(metrics['t_peak'], 1.0, places=2)
+        self.assertAlmostEqual(metrics['x'], 0.3, delta=0.02)
+        self.assertAlmostEqual(metrics['y'], -0.1, delta=0.02)
+        self.assertAlmostEqual(metrics['z'], 0.5, delta=0.02)
+        self.assertAlmostEqual(metrics['peak_g'], 0.59, delta=0.03)
+        self.assertEqual(metrics['rate_hz'], 1000)
+
+    def test_the_sign_follows_the_direction(self):
+        metrics = knock_metrics(gravity_samples(knock_at=0.5, knock=(-0.3, 0.0, -0.4)), 0.0, 2.0)
+        self.assertLess(metrics['x'], 0)
+        self.assertLess(metrics['z'], 0)
+
+    def test_only_the_window_is_looked_at(self):
+        samples = gravity_samples(knock_at=1.5, knock=(0.0, 0.0, 0.5))
+        self.assertLess(knock_metrics(samples, 0.0, 1.0)['peak_g'], 0.01)
+        self.assertGreater(knock_metrics(samples, 1.0, 2.0)['peak_g'], 0.4)
+        self.assertAlmostEqual(knock_metrics(samples, 1.0, 2.0)['t_peak'], 0.5, places=2)
+
+    def test_too_few_samples(self):
+        self.assertIsNone(knock_metrics(gravity_samples(seconds=0.01), 0.0, 1.0))
+        self.assertEqual(csv_snippet(gravity_samples(seconds=0.01), 0.0, 1.0, 0.0), [])
+
+    def test_csv_snippet_is_a_window_around_the_peak(self):
+        samples = gravity_samples(knock_at=1.0, knock=(0.0, 0.0, 0.5))
+        lines = csv_snippet(samples, 0.0, 2.0, 1.0, half=0.1)
+        self.assertEqual(lines[0], 'time_s,x_g,y_g,z_g,res_x_g,res_y_g,res_z_g')
+        times = [float(l.split(',')[0]) for l in lines[1:]]
+        self.assertAlmostEqual(min(times), 0.9, places=2)
+        self.assertAlmostEqual(max(times), 1.1, places=2)
+        self.assertAlmostEqual(float(lines[1].split(',')[3]), -1.0, places=3)
+
+    def test_median(self):
+        self.assertEqual(median([3, 1, 2]), 2)
+        self.assertEqual(median([1, 2, 3, 4]), 2.5)
+        self.assertIsNone(median([]))
+
+
+def map_row(offset, ok=True, z=0.0, x=0.0, peak=0.2):
+    return {'offset': offset, 'value': 266.2 + offset, 'locked': 3 if ok else 0, 'total': 3, 'ok': ok,
+            'pick': {'peak_g': peak, 'x': x, 'y': 0.0, 'z': z, 't_peak': 0.4, 'rms_g': 0.01} if ok else None,
+            'drop': {'peak_g': 0.1} if ok else None}
+
+
+class MapTableTests(unittest.TestCase):
+    def test_zero_crossing_is_interpolated(self):
+        rows = [map_row(-0.5, z=-0.4), map_row(0.0, z=-0.1), map_row(0.25, z=0.15), map_row(0.5, z=0.4)]
+        self.assertEqual(zero_crossings(rows, 'z'), [0.1])
+        self.assertEqual(zero_crossings(rows, 'x'), [])
+
+    def test_failed_positions_are_left_out_of_the_crossings(self):
+        rows = [map_row(-0.5, ok=False), map_row(0.0, z=-0.1), map_row(0.25, z=0.1)]
+        self.assertEqual(zero_crossings(rows, 'z'), [0.125])
+
+    def test_table(self):
+        rows = [map_row(0.25, z=0.15, peak=0.3), map_row(-0.25, z=-0.1, peak=0.1), map_row(0.5, ok=False)]
+        text = '\n'.join(map_table(0, 'z', rows, 0.05))
+        self.assertIn('ADXL map T0 Z', text)
+        self.assertIn('50 ms high-pass', text)
+        self.assertLess(text.index('-0.25'), text.index('+0.25'))        # sorted by offset
+        self.assertIn('3/3', text)
+        self.assertIn('0/3', text)
+        self.assertIn('Quietest pickup: -0.25 mm (0.100 g)', text)
+        self.assertIn('Component z changes sign at -0.05 mm', text)
+        self.assertIn('Nothing is changed by a map', text)
 
 
 # --- detection, plan, prompt (pure) ------------------------------------------------
@@ -315,6 +412,7 @@ class FakeToolhead:
     def __init__(self, dock):
         self.dock, self.homed = dock, 'xyz'
         self.waits = 0
+        self.clock = 0.0
 
     def get_status(self, eventtime):
         if getattr(self.dock, 'homed', False):
@@ -324,6 +422,10 @@ class FakeToolhead:
 
     def wait_moves(self):
         self.waits += 1
+        self.clock += 0.5           # every wait takes half a second of print time
+
+    def get_last_move_time(self):
+        return self.clock
 
     def dwell(self, delay):
         pass
@@ -366,6 +468,37 @@ class FakeChip:
                 g = dock_autotune.FREEFALL
                 values = [g] * 30 + [g * (1 + chip.knock_g)] + [g] * 30
                 return [(i * 0.001, 0.0, 0.0, v) for i, v in enumerate(values)]
+        return Client()
+
+
+class MapChip:
+    """ADXL of a tool: -1 g on z, at 0.25 s after the start of a cycle the pickup knocks with a strength that
+    depends on how far the park values are from the true position, at 0.75 s a small knock of the dropoff"""
+
+    def __init__(self, dock, toolhead, gain=(1.0, 1.0, 2.0)):
+        self.dock, self.toolhead, self.gain = dock, toolhead, gain
+
+    def start_internal_client(self):
+        chip, start = self, self.toolhead.clock
+
+        class Client:
+            def finish_measurements(self):
+                pass
+
+            def get_samples(self):
+                end = chip.toolhead.clock
+                knock = [chip.gain[i] * (chip.dock.tool.params['params_park_' + a] - chip.dock.truth[a])
+                         for i, a in enumerate('xyz')]
+                out = []
+                for i in range(int((end - start) * 1000) + 1):
+                    t = i / 1000.0
+                    x, y, z = 0.0, 0.0, -1.0
+                    if abs(t - 0.25) < 0.0005:
+                        x, y, z = x + knock[0], y + knock[1], z + knock[2]
+                    if abs(t - 0.75) < 0.0005:
+                        z += 0.1
+                    out.append((start + t, x * G, y * G, z * G))
+                return out
         return Client()
 
 
@@ -668,6 +801,92 @@ class CommandTests(unittest.TestCase):
         gcmd = self.scan(T=2, AXES='x', RANGE=0.8)
         self.assertIn('does not know the scan mode', gcmd.text)
         self.assertEqual(self.tool.params['params_park_x'], 149.6)
+
+    # -- ADXL map ----------------------------------------------------------------------------
+
+    def make_map(self, **kw):
+        self.make(**kw)
+        self.printer.objects['adxl345 T2'] = MapChip(self.dock, self.printer.objects['toolhead'])
+
+    def test_map_shows_the_knock_over_the_positions_and_changes_nothing(self):
+        self.make_map(window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-1.0, 1.0)})
+        gcmd = self.scan(T=2, MODE='map', AXES='z', RANGE=0.5, STEP=0.25, REPEATS=1)
+        self.assertIn('ADXL map T2 Z', gcmd.text)
+        self.assertIn('ADXL map finished after 5 pickups, the park values are unchanged', gcmd.text)
+        # the true position of z is 0.1 above the start: the z component changes sign there
+        self.assertIn('Component z changes sign at +0.10 mm', gcmd.text)
+        self.assertIn('Quietest pickup: +0.00 mm', gcmd.text)
+        self.assertEqual(self.tool.params['params_park_z'], 266.2)
+        self.assertEqual(self.dock.pickups, 5)
+
+    def test_map_order_and_repeats(self):
+        self.make_map(window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-1.0, 1.0)})
+        seen = []
+        real = self.tool.set_parameter
+
+        def spy(name, value):
+            if name == 'params_park_z':
+                seen.append(round(value - 266.2, 3))
+            return real(name, value)
+        self.tool.set_parameter = spy
+        self.scan(T=2, MODE='map', AXES='z', RANGE=0.5, STEP=0.25, REPEATS=2)
+        self.assertEqual(seen[:6], [0.0, 0.25, -0.25, 0.5, -0.5, 0.0])        # the last one is the restore
+        self.assertEqual(self.dock.pickups, 10)
+
+    def test_map_stops_a_side_after_failures_in_a_row(self):
+        # the window ends 0.3 above and 0.4 below the start: +0.5, +0.75, +1.0 fail, and from the second one on the
+        # side is skipped
+        self.make_map(window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-0.5, 0.2)}, map_fail_stop='2')
+        gcmd = self.scan(T=2, MODE='map', AXES='z', RANGE=1.5, STEP=0.25, REPEATS=1)
+        offsets = [float(line.split()[0]) for line in gcmd.text.splitlines() if line[:1] in ' +-' and '/' in line]
+        self.assertIn(0.25, offsets)
+        self.assertIn(0.5, offsets)
+        self.assertNotIn(1.0, offsets)          # skipped after 0.5 and 0.75 failed
+        self.assertIn(-0.25, offsets)
+        self.assertIn('0/1', gcmd.text)
+
+    def test_map_needs_the_accelerometer(self):
+        self.make()
+        with self.assertRaises(CommandError) as ctx:
+            self.scan(T=2, MODE='map', AXES='z')
+        self.assertIn('MODE=map needs the accelerometer [adxl345 T2]', str(ctx.exception))
+        self.assertEqual(self.dock.scripts, [])
+
+    def test_unknown_mode(self):
+        self.make_map()
+        with self.assertRaises(CommandError):
+            self.scan(T=2, MODE='nonsense')
+
+    def test_map_with_a_failing_baseline_stops(self):
+        self.make_map(hidden=(0.0, 0.0, 1.5))
+        gcmd = self.scan(T=2, MODE='map', AXES='z', RANGE=0.5, STEP=0.25, REPEATS=1)
+        self.assertIn('STOPPED', gcmd.text)
+        self.assertIn('baseline Z', gcmd.text)
+        self.assertEqual(self.tool.params['params_park_z'], 266.2)
+
+    def test_raw_snippets_are_written(self):
+        self.make_map(window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-1.0, 1.0)})
+        self.scan(T=2, MODE='map', AXES='z', RANGE=0.25, STEP=0.25, REPEATS=1, RAW=1)
+        folder = os.path.join(os.path.dirname(self.module.log_file), 'dock_autotune_adxl')
+        files = sorted(os.listdir(folder))
+        self.assertEqual(files, ['T2_z_+0.000_r1_pickup.csv', 'T2_z_+0.250_r1_pickup.csv', 'T2_z_-0.250_r1_pickup.csv'])
+        with open(os.path.join(folder, files[0])) as f:
+            self.assertTrue(f.readline().startswith('time_s,x_g'))
+
+    def test_map_rows_go_to_the_log(self):
+        self.make_map(window={'x': WINDOW['x'], 'y': WINDOW['y'], 'z': (-1.0, 1.0)})
+        self.scan(T=2, MODE='map', AXES='z', RANGE=0.25, STEP=0.25, REPEATS=1)
+        with open(self.module.log_file) as f:
+            text = f.read()
+        self.assertEqual(text.count('"map"'), 3)
+        self.assertIn('"peak_g"', text)
+
+    def test_dry_run_of_a_map(self):
+        self.make_map()
+        gcmd = self.scan(T=2, MODE='map', AXES='z', DRY_RUN=1)
+        self.assertIn('ADXL map', gcmd.text)
+        self.assertIn('nothing moved', gcmd.text)
+        self.assertEqual(self.dock.scripts, [])
 
     # -- preparation like a print start ---------------------------------------------------
 
