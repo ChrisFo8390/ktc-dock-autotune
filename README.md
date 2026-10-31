@@ -49,7 +49,9 @@ The installer does everything in one go:
 
 * links `klipper/extras/dock_autotune.py` into Klipper and copies `config/dock_autotune.cfg` to your config
   directory (an existing file is never overwritten),
-* adds `[include dock_autotune.cfg]` to `printer.cfg` (above the `SAVE_CONFIG` block, line endings kept),
+* installs `dock_autotune_macro.cfg` as well (see "Macro list" below),
+* adds `[include dock_autotune.cfg]` and `[include dock_autotune_macro.cfg]` to `printer.cfg` (above the
+  `SAVE_CONFIG` block, line endings kept),
 * adds the `[update_manager ktc-dock-autotune]` entry to `moonraker.conf`,
 * restarts Klipper, and Moonraker if it changed `moonraker.conf` (Moonraker reads its config only at start,
   without that restart the entry does not show up in Mainsail). `sudo` must work without a password,
@@ -60,10 +62,11 @@ again changes nothing that is already there.
 
 | Option | |
 |---|---|
-| `--no-include` | do not touch `printer.cfg` (add `[include dock_autotune.cfg]` yourself) |
+| `--no-include` | do not touch `printer.cfg` (add the two include lines yourself) |
+| `--no-macro` | do not install the macro for the macro list |
 | `--no-update-manager` | do not touch `moonraker.conf` |
 | `--no-restart` | do not restart anything |
-| `--uninstall` | remove the link and the include line (`dock_autotune.cfg` and the update manager entry stay) |
+| `--uninstall` | remove the link and the include lines (the `.cfg` files and the update manager entry stay) |
 | `KLIPPER_PATH=…`, `CONFIG_PATH=…` | other locations than `~/klipper` and `~/printer_data/config` |
 
 Update with `git pull` in the clone (or the update manager) and restart Klipper.
@@ -74,6 +77,18 @@ entry are in `~/printer_data/logs/moonraker.log` (search for `update_manager`).
 
 Without Git: copy `klipper/extras/dock_autotune.py` to `~/klipper/klippy/extras/` and `config/dock_autotune.cfg`
 to the config directory by hand.
+
+## Macro list (Mainsail, Fluidd, HelixScreen)
+
+`DOCK_AUTOTUNE` is a command that the module registers. Mainsail, Fluidd and the touch UIs list only
+`[gcode_macro]` sections, so the command works in the console but is not in the macro list, and a UI cannot offer
+it. `dock_autotune_macro.cfg` fixes that: it defines `[gcode_macro DOCK_AUTOTUNE]` with `rename_existing: DOCK_AUTOTUNE_BASE`,
+takes the name and forwards all parameters to the module. Mainsail shows an input field for every parameter
+(`T`, `AXES`, `RANGE`, `STEP`, `REPEATS`, `SPEED`, `BED`, `SOAK`, `PREPARE`, `TOUCH`, `ADXL`, `DRY_RUN`). `T` is required.
+The prompt buttons and all examples below work unchanged. `DOCK_AUTOTUNE_INTERRUPT` stays a module command, it is
+meant to be typed or put on a button. An existing installation gets the new file with `git pull && ./install.sh`.
+Without the module the macro stops Klipper at start (`Existing command 'DOCK_AUTOTUNE' not found`), so keep both
+include lines together.
 
 ## Use
 

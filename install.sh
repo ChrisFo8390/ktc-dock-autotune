@@ -2,7 +2,7 @@
 # KTC Dock Autotune installer
 #
 # Links klipper/extras/dock_autotune.py into Klipper's extras directory, installs the
-# configuration, adds [include dock_autotune.cfg] to printer.cfg, adds an update manager entry
+# configuration and the macro for the Mainsail macro list, adds both includes to printer.cfg, adds an update manager entry
 # to moonraker.conf and restarts Klipper (and Moonraker, which only reads its config at start).
 # Backups of printer.cfg and moonraker.conf are made before they are changed.
 #
@@ -12,9 +12,10 @@
 #
 # Options:
 #   --no-include           do not touch printer.cfg
+#   --no-macro             do not install the DOCK_AUTOTUNE macro (the command works, but Mainsail does not list it)
 #   --no-update-manager    do not touch moonraker.conf
 #   --no-restart           do not restart Klipper / Moonraker
-#   --uninstall            remove the link and the include line again (the rest is kept)
+#   --uninstall            remove the link and the include lines again (the rest is kept)
 #   -h, --help             this text
 #
 # Other locations: KLIPPER_PATH=... CONFIG_PATH=... ./install.sh
@@ -30,6 +31,7 @@ export LC_ALL=C
 
 MODE="install"
 DO_INCLUDE="yes"
+DO_MACRO="yes"
 DO_UPDATE_MANAGER="yes"
 DO_RESTART="yes"
 RESTART_MOONRAKER="no"
@@ -37,12 +39,13 @@ RESTART_MOONRAKER="no"
 for arg in "$@"; do
     case "${arg}" in
         --no-include)        DO_INCLUDE="no" ;;
+        --no-macro)          DO_MACRO="no" ;;
         --no-update-manager) DO_UPDATE_MANAGER="no" ;;
         --no-restart)        DO_RESTART="no" ;;
         --include|--update-manager|--restart) ;;    # the default since this version, kept for old command lines
         --uninstall)         MODE="uninstall" ;;
         -h|--help)
-            sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -61,8 +64,10 @@ else
     INSTALL_PATH="${INSTALL_PATH:-${HOME}/${REPO_NAME}}"
 fi
 EXTRAS="${KLIPPER_PATH}/klippy/extras"
-INCLUDE_LINE="[include dock_autotune.cfg]"
-INCLUDE_PATTERN='^\[include[[:space:]]+dock_autotune\.cfg\][[:space:]]*$'     # [[:space:]] also matches a CR
+CONFIG_FILES="dock_autotune.cfg"
+if [ "${DO_MACRO}" = "yes" ]; then
+    CONFIG_FILES="${CONFIG_FILES} dock_autotune_macro.cfg"
+fi
 
 function preflight_checks {
     if [ "$EUID" -eq 0 ]; then
@@ -123,29 +128,37 @@ function install_config {
         DO_UPDATE_MANAGER="no"
         return
     fi
-    if [ ! -e "${CONFIG_PATH}/dock_autotune.cfg" ]; then
-        cp "${INSTALL_PATH}/config/dock_autotune.cfg" "${CONFIG_PATH}/dock_autotune.cfg"
-        echo "[INSTALL] Configuration installed to ${CONFIG_PATH}/dock_autotune.cfg"
-    else
-        echo "[INFO] ${CONFIG_PATH}/dock_autotune.cfg exists and is not overwritten"
-        echo "[INFO] Compare it with ${INSTALL_PATH}/config/dock_autotune.cfg for new settings"
-    fi
+    local name
+    for name in ${CONFIG_FILES}; do
+        if [ ! -e "${CONFIG_PATH}/${name}" ]; then
+            cp "${INSTALL_PATH}/config/${name}" "${CONFIG_PATH}/${name}"
+            echo "[INSTALL] Installed ${CONFIG_PATH}/${name}"
+        else
+            echo "[INFO] ${CONFIG_PATH}/${name} exists and is not overwritten"
+            echo "[INFO] Compare it with ${INSTALL_PATH}/config/${name} for new settings"
+        fi
+    done
 }
 
-# Adds [include dock_autotune.cfg] to printer.cfg: above the SAVE_CONFIG block if there is one
-# (everything below it belongs to Klipper), otherwise at the end. Keeps the line endings of the file.
+# Regular expression for the line [include <file>] (a CR at the end of the line is matched by [[:space:]])
+function include_pattern {
+    printf '^\[include[[:space:]]+%s\][[:space:]]*$' "${1//./\.}"
+}
+
+# Adds [include <file>] to printer.cfg: above the SAVE_CONFIG block if there is one (everything below it
+# belongs to Klipper), otherwise at the end. Keeps the line endings of the file.
 function add_include {
-    local cfg="${CONFIG_PATH}/printer.cfg"
+    local name="$1" cfg="${CONFIG_PATH}/printer.cfg" line="[include $1]"
     if [ "${DO_INCLUDE}" != "yes" ]; then
-        echo "[INFO] printer.cfg not changed, add this line yourself:  ${INCLUDE_LINE}"
+        echo "[INFO] printer.cfg not changed, add this line yourself:  ${line}"
         return
     fi
     if [ ! -f "${cfg}" ]; then
-        echo "[WARNING] ${cfg} not found, add this line yourself:  ${INCLUDE_LINE}"
+        echo "[WARNING] ${cfg} not found, add this line yourself:  ${line}"
         return
     fi
-    if grep -qE "${INCLUDE_PATTERN}" "${cfg}"; then
-        echo "[INFO] ${INCLUDE_LINE} is already in printer.cfg"
+    if grep -qE "$(include_pattern "${name}")" "${cfg}"; then
+        echo "[INFO] ${line} is already in printer.cfg"
         return
     fi
     backup_file "${cfg}"
@@ -156,17 +169,17 @@ function add_include {
     marker="$(grep -nE '^#\*# <-+ SAVE_CONFIG -+>' "${cfg}" | head -n 1 | cut -d: -f1 || true)"
     tmp="$(mktemp)"
     if [ -n "${marker}" ]; then
-        awk -v n="${marker}" -v line="${INCLUDE_LINE}" -v cr="${cr}" \
+        awk -v n="${marker}" -v line="${line}" -v cr="${cr}" \
             'NR == n { printf "%s%s\n%s\n", line, cr, cr } { print }' "${cfg}" > "${tmp}"
     else
         { cat "${cfg}"
           if [ -n "$(tail -c 1 "${cfg}")" ]; then printf '%s\n' "${cr}"; fi
-          printf '%s\n%s%s\n' "${cr}" "${INCLUDE_LINE}" "${cr}"
+          printf '%s\n%s%s\n' "${cr}" "${line}" "${cr}"
         } > "${tmp}"
     fi
     cat "${tmp}" > "${cfg}"      # not mv: keeps owner and permissions of printer.cfg
     rm -f "${tmp}"
-    echo "[INSTALL] Added ${INCLUDE_LINE} to ${cfg}"
+    echo "[INSTALL] Added ${line} to ${cfg}"
 }
 
 function print_update_manager_section {
@@ -235,11 +248,14 @@ function restart_services {
 function uninstall {
     local target="${EXTRAS}/dock_autotune.py"
     local cfg="${CONFIG_PATH}/printer.cfg"
-    if [ -f "${cfg}" ] && grep -qE "${INCLUDE_PATTERN}" "${cfg}"; then
-        backup_file "${cfg}"
-        sed -i -E "/${INCLUDE_PATTERN}/d" "${cfg}"
-        echo "[UNINSTALL] Removed ${INCLUDE_LINE} from printer.cfg"
-    fi
+    local name
+    for name in dock_autotune.cfg dock_autotune_macro.cfg; do
+        if [ -f "${cfg}" ] && grep -qE "$(include_pattern "${name}")" "${cfg}"; then
+            backup_file "${cfg}"
+            sed -i -E "/$(include_pattern "${name}")/d" "${cfg}"
+            echo "[UNINSTALL] Removed [include ${name}] from printer.cfg"
+        fi
+    done
     if [ -L "${target}" ]; then
         rm -f "${target}"
         echo "[UNINSTALL] Removed ${target}"
@@ -248,7 +264,7 @@ function uninstall {
     else
         echo "[INFO] ${target} is not installed"
     fi
-    echo "[INFO] Not touched: ${CONFIG_PATH}/dock_autotune.cfg and the update manager section in moonraker.conf."
+    echo "[INFO] Not touched: ${CONFIG_PATH}/dock_autotune*.cfg and the update manager section in moonraker.conf."
     restart_services
 }
 
@@ -278,7 +294,10 @@ fi
 check_download
 link_module
 install_config
-add_include
+add_include dock_autotune.cfg
+if [ "${DO_MACRO}" = "yes" ]; then
+    add_include dock_autotune_macro.cfg
+fi
 add_update_manager
 restart_services
 show_completion_message
