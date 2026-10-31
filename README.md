@@ -3,41 +3,39 @@
 Finds the best park position of a [klipper-toolchanger](https://github.com/viesturz/klipper-toolchanger)
 (KTC) dock automatically.
 
-**Status: prototype. Tested against the real `toolchanger.py` in a simulation with a modelled
-dock, and with unit tests. Not yet run on a real printer.** Read "Safety" before the first run.
+**Status: prototype.** Tested with unit tests and in a simulation with the real `toolchanger.py`, and run once on
+one printer (Voron with Cartographer, five tools). Read "Safety" before the first run.
 
-## What it does
+## How it works
 
-A tool locks into the shuttle only inside a small window of positions. `DOCK_AUTOTUNE` finds that
-window per axis and sets `params_park_x/y/z` of the tool to its centre:
+A tool locks into the shuttle only inside a window of positions. `DOCK_AUTOTUNE` looks for that window per axis
+and puts `params_park_x/y/z` of the tool in the middle of it:
 
-1. One *trial* is a pickup (`SELECT_TOOL`, the verify at the lock position of the pickup path must see
-   the tool) followed by the dropoff (`UNSELECT_TOOL`), `repeats` times. All of them have to lock.
-2. Starting at the current value (it must lock, otherwise the scan stops) the offset is moved outwards
-   in `step` increments on both sides until a trial fails (`range_*` is the limit). Then the interval between
-   the last good and the first failing offset is halved until it is not larger than `resolution` (for example
-   `STEP=0.2 RESOLUTION=0.05`: two extra trials per edge).
-3. The centre of the window is tried again and, if it locks, applied. The axes are done one after the
-   other (x, y, z). If a side did not fail within the range the window is "not closed" and that axis
-   is left alone.
+1. A *trial* is a pickup (`SELECT_TOOL`, the tool detection at the `verify` waypoint must see the tool) and a
+   dropoff (`UNSELECT_TOOL`), `repeats` times. All of them have to lock.
+2. Starting at the current value (it has to lock, otherwise the scan stops) the offset moves outwards in `step`
+   increments on both sides until a trial fails. Then the interval at the edge is halved down to `resolution`.
+3. The centre of the window is tried again and, if it locks, applied. Axes are done one after the other.
 
-It tunes in the same coordinate frame as a real tool change (the toolchanger drops the tool offsets
-during a change), so the values are valid for production. The measuring signal is the tool detection
-pin, the same check KTC does at the lock position. An accelerometer on the tool can be recorded
-alongside and can stop the scan (`abort_g`), but it never decides.
+The scan runs in the coordinate frame of a real tool change, so the values are valid for printing. The signal is the
+tool detection pin. An accelerometer on the tool can be recorded alongside (see "Accelerometer").
+
+If no trial fails on a side within `range_*`, there is no edge: the window is *not closed* and that axis is left
+alone. The message says how wide the window is at least. Run it again with a larger range and step, for example
+`RANGE=1.2 STEP=0.2`.
 
 ## Requirements
 
-* KTC with tool detection pins (`detection_pin` in every `[tool]`), `require_tool_present: False` is fine.
-* A toolchanger `error_gcode` that **leaves the dock** after a failed pickup and that does not pause while
-  a scan runs (`printer.dock_autotune.active`). With the stock `error_gcode: PAUSE` a failing trial
-  pauses the print; the module notices that and stops with a message. If the handler does not get the
-  shuttle out of the dock the scan stops as well (it checks that the shuttle is back at `params_safe_y`).
-  [`examples/toolchanger-error-handler.cfg`](examples/toolchanger-error-handler.cfg) is a handler that does
-  this (it needs the Mainsail/Fluidd client macros `PAUSE` and `_CLIENT_VARIABLE`).
-* Not usable while a print is running or paused. All axes homed, or let the preparation do it (see "Use").
-* The prompt needs a frontend that understands `// action:prompt_*` (Mainsail, Fluidd, KlipperScreen).
-  Without one, call `DOCK_AUTOTUNE` with `PREPARE=1` or `PREPARE=0` and no prompt is needed.
+* KTC with a `detection_pin` in every `[tool]`.
+* A toolchanger `error_gcode` that **leaves the dock** after a failed pickup and does not pause while a scan runs
+  (`printer.dock_autotune.active`). With the stock `error_gcode: PAUSE` a failing trial pauses the print and the scan
+  stops. [`examples/toolchanger-error-handler.cfg`](examples/toolchanger-error-handler.cfg) is such a handler (it needs
+  the Mainsail/Fluidd client macros `PAUSE` and `_CLIENT_VARIABLE`).
+* No running or paused print.
+* For the prompt: a frontend that understands `// action:prompt_*` (Mainsail, Fluidd, KlipperScreen). Without one use
+  `PREPARE=1` or `PREPARE=0`.
+* Recommended: `fade_end` in `[bed_mesh]` (for example `fade_start: 1`, `fade_end: 10`, `fade_target: 0`), otherwise
+  the mesh shifts the height of the dock.
 
 ## Install
 
@@ -46,160 +44,110 @@ git clone https://github.com/ChrisFo8390/ktc-dock-autotune.git ~/ktc-dock-autotu
 ~/ktc-dock-autotune/install.sh
 ```
 
-The installer does everything in one go:
-
-* links `klipper/extras/dock_autotune.py` into Klipper and copies `config/dock_autotune.cfg` to your config
-  directory (an existing file is never overwritten),
-* installs `dock_autotune_macro.cfg` as well (see "Macro list" below),
-* adds `[include dock_autotune.cfg]` and `[include dock_autotune_macro.cfg]` to `printer.cfg` (above the
-  `SAVE_CONFIG` block, line endings kept),
-* adds the `[update_manager ktc-dock-autotune]` entry to `moonraker.conf`,
-* restarts Klipper, and Moonraker if it changed `moonraker.conf` (Moonraker reads its config only at start,
-  without that restart the entry does not show up in Mainsail). `sudo` must work without a password,
-  otherwise the script prints the command to run.
-
-Backups (`printer.cfg.bak.<date>`, `moonraker.conf.bak.<date>`) are made before a file is changed. Running it
-again changes nothing that is already there.
+The installer links the module into Klipper, copies `dock_autotune.cfg` (your settings, never overwritten) and
+`dock_autotune_macro.cfg` (updated on every run), adds both `[include ...]` lines to `printer.cfg` (above
+`SAVE_CONFIG`), adds an `[update_manager]` entry to `moonraker.conf` and restarts Klipper (and Moonraker if it changed
+`moonraker.conf`). Backups are made before a file is changed, and running it again changes nothing that is already
+there. `sudo` has to work without a password, otherwise the script prints the command to run.
 
 | Option | |
 |---|---|
-| `--no-include` | do not touch `printer.cfg` (add the two include lines yourself) |
+| `--no-include` | do not touch `printer.cfg` |
 | `--no-macro` | do not install the macro for the macro list |
 | `--no-update-manager` | do not touch `moonraker.conf` |
 | `--no-restart` | do not restart anything |
 | `--uninstall` | remove the link and the include lines (the `.cfg` files and the update manager entry stay) |
 | `KLIPPER_PATH=…`, `CONFIG_PATH=…` | other locations than `~/klipper` and `~/printer_data/config` |
 
-Update with `git pull` in the clone (or the update manager) and restart Klipper.
-
-The update manager needs the clone (`path:` in the entry) to be a Git repository of the printer user with the
-`origin` from the entry. A module copied by hand has no entry. Moonraker's reasons for a missing or invalid
-entry are in `~/printer_data/logs/moonraker.log` (search for `update_manager`).
-
-Without Git: copy `klipper/extras/dock_autotune.py` to `~/klipper/klippy/extras/` and `config/dock_autotune.cfg`
-to the config directory by hand.
-
-## Macro list (Mainsail, Fluidd, HelixScreen)
-
-`DOCK_AUTOTUNE` is a command that the module registers. Mainsail, Fluidd and the touch UIs list only
-`[gcode_macro]` sections, so the command works in the console but is not in the macro list, and a UI cannot offer
-it. `dock_autotune_macro.cfg` fixes that: it defines `[gcode_macro DOCK_AUTOTUNE]` and calls the command of the module,
-`DOCK_AUTOTUNE_RUN`, with all parameters. The module notices the macro and then does not register the name
-`DOCK_AUTOTUNE` itself. Mainsail shows an input field for every parameter (`T`, `AXES`, `RANGE`, `STEP`, `REPEATS`,
-`SPEED`, `BED`, `SOAK`, `PREPARE`, `TOUCH`, `ADXL`, `DRY_RUN`). `T` is required.
-
-* The macro must not use `rename_existing`: Mainsail leaves macros that have it out of its list.
-* The prompt buttons and all examples below work unchanged. Without the macro file the module registers
-  `DOCK_AUTOTUNE` itself, and `DOCK_AUTOTUNE_RUN` always works.
-* `DOCK_AUTOTUNE_INTERRUPT` stays a module command, it is meant to be typed or put on a button.
-* `install.sh` copies the macro file and updates it with every run (`dock_autotune.cfg`, which holds your settings,
-  is never overwritten). Module and macro file belong together: update both with `git pull && ./install.sh`.
+Update with `git pull && ./install.sh` in the clone: module and macro file belong together.
 
 ## Use
 
-The docks have to be tuned in the state they are used in: same bed temperature, gantry levelled, and
-(with a touch homing) the Z zero taken by the touch tool, because that zero depends on the bed and on the tool.
-`DOCK_AUTOTUNE` therefore starts with a **preparation** that does what your `PRINT_START` does before the tools
-are prepared. It works from any state of the machine: homed or not, cold or hot, a tool on the shuttle or not.
-
 ```
-DOCK_AUTOTUNE T=1 DRY_RUN=1                 # only prints the detection and the plan
-DOCK_AUTOTUNE T=1 AXES=z RANGE=0.4          # first run: one axis, small range, watch it
-DOCK_AUTOTUNE T=1                           # x, y, z with the configured ranges
-DOCK_AUTOTUNE_INTERRUPT                     # stops after the current trial (M112 stops at once)
+DOCK_AUTOTUNE T=1 DRY_RUN=1             # detection and plan, nothing moves
+DOCK_AUTOTUNE T=1 AXES=z RANGE=0.4      # first run: one axis, small range, watch it
+DOCK_AUTOTUNE T=1                       # x, y and z with the configured ranges
+DOCK_AUTOTUNE_INTERRUPT                 # stops after the current trial (M112 stops at once)
 ```
 
-Without `PREPARE` the command shows a prompt and does nothing else:
+`DOCK_AUTOTUNE` also is in the macro list of Mainsail, with an input field per parameter (see "Macro list").
 
-* It names the detected probe (Cartographer, Beacon, eddy current, plain probe, or none: Z endstop) and
-  whether a touch homing is used (`CARTOGRAPHER_TOUCH_HOME`; Beacon with `home_method: contact`, where
-  `G28 Z` touches), and lists the steps.
-* **Prepare and start** runs them with the bed temperature shown (default `bed_temp: 70`, changed with the
-  -10 / -5 / +5 / +10 buttons or `BED=`), then the scan starts.
-* **The machine is already prepared** skips the preparation (like `PREPARE=0`).
-* Preparation steps: `INITIALIZE_TOOLCHANGER`; a tool on the shuttle is put back into its dock (with a `G28`
-  first if nothing is homed); `M190` to the bed temperature (`SOAK=<s>` waits longer); `G28`; `QUAD_GANTRY_LEVEL`
-  (or `Z_TILT_ADJUST`); `BED_MESH_CLEAR`; the touch homing with `touch_tool` (default T0, **only that tool**,
-  it is picked up with `SELECT_TOOL RESTORE_AXIS=Z`, not with `T0`, so AFC is not asked to load anything and Z
-  comes back to where it was before the pickup, as with the `T` command, instead of staying at the height of the
-  dock, `touch_restore_axis` changes that): nozzle starts heating to `touch_temp`, `before_touch` runs (one G-code
-  line per line of the option: **set your brush macro here**, for example `BRUSH`, it is the place near the brush
-  where the nozzle heats up), wait for the temperature, `touch_repeats` times the touch command, nozzle off,
-  tool back into its dock. Without a touch homing the Z zero is taken again with `G28 Z` after the levelling.
-  A failure in any step stops everything with a report.
-* If Z cannot be homed with an empty shuttle (the probe sits on a tool: `tool_probe`; or `probe:` is the Z
-  endstop but no probe section exists; or the legacy `[scanner]` module) the prompt says so and offers only
-  "The machine is prepared - continue" or "Close". `PREPARE=1` is refused with the same message. Prepare the
-  machine by hand and use `PREPARE=0`.
+**Preparation.** Docks have to be tuned in the state they are used in: bed temperature, levelled gantry, and with a
+touch homing the Z zero taken by the touch tool. Without `PREPARE` the command shows a prompt with the detected probe
+and the steps; **Prepare and start** runs them (bed temperature 70 °C by default, change it with the buttons or
+`BED=`), **The machine is already prepared** skips them. The steps follow a `PRINT_START`:
 
-`PREPARE=0` expects the state of a print start: homed, levelled, Z reference from the same homing as in
-production, bed hot, shuttle empty or the tool of the scan on it. `TOUCH=0` leaves out the touch homing.
+1. `INITIALIZE_TOOLCHANGER`, a tool on the shuttle goes back into its dock
+2. `M190` (bed), `G28`, `QUAD_GANTRY_LEVEL` (or `Z_TILT_ADJUST`), `BED_MESH_CLEAR`
+3. touch homing with `touch_tool` (T0 by default, picked up with `SELECT_TOOL`, so AFC is not involved): nozzle heats to
+   `touch_temp` while `before_touch` runs (**put your brush macro there**), then the touch command runs
+   `touch_repeats` times, the nozzle is turned off and the tool goes back into its dock. Without a touch homing the Z
+   zero is taken with `G28 Z` after the levelling.
 
-At the end the new values are applied until the next restart and printed as `params_park_x: ...`
-lines. Copy them into `toolchanger/tools/T<n>.cfg`. (`SAVE_TOOL_PARAMETER` plus `SAVE_CONFIG` works too,
-but the line has to be commented out in the cfg first, otherwise Klipper refuses the config.)
+Detected are Cartographer (`CARTOGRAPHER_TOUCH_HOME`), Beacon (`home_method: contact`, touch is `G28 Z`), eddy current
+probes, plain probes and a Z endstop. If Z cannot be homed with an empty shuttle (probe on a tool, `probe:` endstop
+without a probe, legacy `[scanner]`), the prompt says so and only offers to continue with a machine you prepared by
+hand (`PREPARE=0`). After a preparation the machine stays prepared, so the next run can use `PREPARE=0`.
 
-**"Window not closed".** If no trial fails on a side within `range_*`, there is no edge there and the axis is
-left alone. The message says how far everything locked (`at least 0.80 mm wide`) and which side is open. The
-window is then wider than the range: run the axis again with a larger range and a coarser step, for example
-`DOCK_AUTOTUNE T=0 AXES=z RANGE=1.2 STEP=0.2` (a failing pickup next to the window is harmless, but watch the
-first runs). A dock with a self-centring coupling can lock over a wide range, and the detection pin only says
-"locked" or "not locked": it does not tell a good position from a worse one inside the window.
-After a preparation the machine stays in the prepared state, so the next run can use `PREPARE=0`.
-
-Every failing trial prints a red `Expected tool ... but active is None` in the console. That is expected,
-it is how the edge of the window is found.
+**Result.** The new values apply until the next restart and are printed as `params_park_x: ...` lines. Copy them into
+`toolchanger/tools/T<n>.cfg`. A failing trial prints a red `Expected tool ... but active is None`: that is expected,
+it is how the edge is found. A scan takes at most `2 * range / step` trials per axis plus the edge refinement
+(`DRY_RUN=1` prints the number), each with `repeats` pickups.
 
 | Parameter | |
 |---|---|
 | `T=<n>` | tool, required |
 | `AXES=xyz` | axes to tune, default all |
-| `STEP=0.1`, `RESOLUTION=0.05`, `RANGE=<mm>`, `RANGE_X/Y/Z=<mm>` | override `step`, `resolution` and `range_*` |
-| `REPEATS=2` | pickups per candidate |
-| `SPEED=0.5` | factor on `params_path_speed` while scanning |
-| `ADXL=1` | record the accelerometer of the tool (`[adxl345 T<n>]`) |
-| `PREPARE=1` / `PREPARE=0` | prepare like a print start, then scan / the machine is prepared; no prompt |
-| `BED=<°C>`, `SOAK=<s>` | bed temperature of the preparation (default `bed_temp`), extra wait |
-| `TOUCH=0` | no touch homing in the preparation |
-| `DRY_RUN=1` | print the plan, move nothing |
+| `STEP`, `RESOLUTION`, `RANGE`, `RANGE_X/Y/Z` | override the config (mm) |
+| `REPEATS`, `SPEED` | pickups per candidate, factor on `params_path_speed` while scanning |
+| `PREPARE=1\|0` | prepare first and scan / the machine is prepared; no prompt |
+| `BED`, `SOAK`, `TOUCH=0` | bed temperature (°C), extra wait (s), no touch homing |
+| `ADXL=1` | record the accelerometer of the tool |
+| `DRY_RUN=1` | only print the plan |
 
-Does the dock position depend on the bed temperature? Scan the same dock twice, for example `BED=60` and
-`BED=100`, and compare the `params_park_z` lines. If they differ by more than a fraction of the window, tune at the
-temperature you print at most and keep in mind that the other prints sit closer to the edge.
+All options with their defaults are in [`config/dock_autotune.cfg`](config/dock_autotune.cfg).
 
-A scan takes at most `2 * range / step + 4` trials per axis (`DRY_RUN=1` prints the number), each
-`repeats` pickups. Estimate, not measured on a printer: 15 to 25 s per pickup at half speed, so
-plan 15 to 30 minutes per dock.
+Does the dock position depend on the bed temperature? Scan the same dock at `BED=60` and `BED=100` and compare the
+`params_park_z` lines.
 
 ## Safety
 
-* **Be at the machine** for the first runs and keep `M112` at hand. A failing pickup next to the
-  window is harmless, a position far outside of it can hit the dock. That is why the ranges are small
-  and why the scan stops when the baseline (the current value) does not lock.
-* Speed and acceleration are reduced during the scan and restored afterwards, also after an error.
-  The park values go back to the old ones if the scan is stopped or fails.
-* After a failed pickup the toolchanger is initialized again and checked: shuttle empty, no tool
-  detected, shuttle at `params_safe_y`. Anything else stops the scan.
-* The scan uses `SELECT_TOOL`/`UNSELECT_TOOL` directly, not the `T<n>` commands. AFC is not asked to load
-  or unload anything, but it sees the extruder activations and may take the scanned tool as its current
-  lane. Check the AFC state (and that the toolchanger and AFC agree about the tool) before the next print.
-* Tune with the mesh out of the way: set `fade_end` in `[bed_mesh]` (for example `fade_start: 1`,
-  `fade_end: 10`, `fade_target: 0`), otherwise the mesh changes the dock height by its edge value.
+* **Be at the machine** for the first runs and keep `M112` at hand. A failing pickup next to the window is harmless,
+  a position far outside of it can hit the dock, so the default ranges are small.
+* Speed and acceleration are reduced during the scan and restored afterwards, also after an error. The park values
+  go back to the old ones if the scan stops or fails.
+* After a failed pickup the toolchanger is initialized again and checked: shuttle empty, no tool detected, shuttle at
+  `params_safe_y`. Anything else stops the scan.
+* The scan uses `SELECT_TOOL`/`UNSELECT_TOOL`, not the `T<n>` commands. AFC is not asked to load anything but sees
+  the extruder activations. Check that AFC and the toolchanger agree about the tool before the next print.
 
 ## Accelerometer (optional)
 
-`ADXL=1` records the accelerometer of the tool during every pickup/dropoff and writes `peak_g`
-(largest deviation from the median, in g) to the log. The sections must be named per tool,
-`[adxl345 T0]` ... `[adxl345 T4]`; an unnamed `[adxl345]` in every tool cfg is merged by Klipper into one
-chip, the last one wins. `abort_g` stops the scan when a trial shows a shock above that value. Use it as a
-guard, not as a measure of quality: how well the shock separates a good from a bad position has to
-be seen on the machine first.
+`ADXL=1` records the accelerometer of the tool during every pickup and dropoff and writes `peak_g` (largest deviation
+from the median, in g) to the log. The chips have to be named per tool, `[adxl345 T0]` ... `[adxl345 T4]` (an unnamed
+`[adxl345]` in several files is merged into one chip). `abort_g` stops the scan when a trial shows a shock above that
+value. Whether the shock tells a good position from a worse one inside the window has to be seen on the machine.
 
-## Files written
+## Macro list
 
-`~/printer_data/logs/dock_autotune.jsonl`: one line per trial (`tool`, `axis`, `value`, `ok`, `peak_g`,
-`error`), a summary at the end of a scan, a line if it was stopped. `printer.dock_autotune` (Mainsail
-console, macros): `active`, `tool`, `axis`, `phase`, `trial`, `result`.
+Mainsail, Fluidd and touch UIs list only `[gcode_macro]` sections, not commands that a module registers.
+`dock_autotune_macro.cfg` defines `[gcode_macro DOCK_AUTOTUNE]`, which calls the module command `DOCK_AUTOTUNE_RUN` with
+all parameters. The module notices that macro and does not register the name itself. Do not add `rename_existing` to
+it: Mainsail leaves such macros out of its list. Add the macro to a group under *Interface Settings → Macros*.
+
+## Troubleshooting
+
+| Problem | Check |
+|---|---|
+| Klipper stops: `Existing command 'DOCK_AUTOTUNE' not found` | old macro file with `rename_existing`: `git pull && ./install.sh` |
+| `DOCK_AUTOTUNE` missing in the macro list | `dock_autotune_macro.cfg` included? Reload the page after a restart |
+| No `[update_manager]` entry in Mainsail | restart Moonraker; the clone has to be a Git repository of the printer user; see `moonraker.log` |
+| `ADXL=1` but "no [adxl345 T<n>] section" | name the chips per tool, see "Accelerometer" |
+| Scan stops: "does not know the scan mode" | the `error_gcode` pauses: use the handler from `examples/` |
+| Touch homing starts at the height of the dock | `touch_restore_axis: Z` (default) brings Z back after the pickup |
+
+Files written: `~/printer_data/logs/dock_autotune.jsonl` (one line per trial with `tool`, `axis`, `value`, `ok`,
+`peak_g`, `error`, a summary per scan). `printer.dock_autotune` has `active`, `tool`, `axis`, `phase`, `trial`, `result`.
 
 ## Tests
 
