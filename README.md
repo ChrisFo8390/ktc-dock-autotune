@@ -81,7 +81,7 @@ DOCK_AUTOTUNE T=1                       # x, y and z with the configured ranges
 DOCK_AUTOTUNE_INTERRUPT                 # stops after the current trial (M112 stops at once)
 ```
 
-What the command does without further parameters is set in `dock_autotune.cfg`: `mode` (scan or map), `axes`,
+What the command does without further parameters is set in `dock_autotune.cfg`: `mode` (scan, map or seat), `axes`,
 `prepare` (ask, yes, no), `adxl`, `adxl_raw`, the ranges and so on. With `mode: map`, `axes: z` and `prepare: no`
 the ADXL map of the Z axis is `DOCK_AUTOTUNE T=0`. A parameter of the call always wins.
 
@@ -119,6 +119,7 @@ it is how the edge is found. A scan takes at most `2 * range / step` trials per 
 | `BED`, `SOAK`, `TOUCH=0` | bed temperature (°C), extra wait (s), no touch homing |
 | `ADXL=1` | record the accelerometer of the tool during a scan (`peak_g` in the log) |
 | `MODE=map`, `RAW=1` | ADXL map instead of a scan, with CSV snippets (see "ADXL map") |
+| `MODE=seat` | seat test: lift into the tool without taking it out of the dock (see "Seat test") |
 | `DRY_RUN=1` | only print the plan |
 
 All options with their defaults are in [`config/dock_autotune.cfg`](config/dock_autotune.cfg).
@@ -170,6 +171,39 @@ vertical axis tells how the chip sits (a chip that reads -1 g on z points down).
 
 With `ADXL=1` a normal scan records the accelerometer too and writes `peak_g` per trial to the log. `abort_g` stops the
 scan when a trial shows a shock above that value.
+
+## Seat test (optional)
+
+For shuttles that take the tool with pins from below (StealthChanger) the detection pin says little: the rounded pins
+find their way in at almost any position, and the tool "locks" anyway. What matters is how cleanly it seats, because
+a tool that is pushed sideways while the shuttle lifts scrapes its pins. `MODE=seat` measures that without taking the
+tool out of its dock:
+
+```
+DOCK_AUTOTUNE T=0 MODE=seat
+```
+
+The empty shuttle drives the entry of the pickup path (`close_y`, the start of `params_pickup_path`), lifts into the
+tool up to the `verify` waypoint, reads the tool detection and goes down again. That is the end of a dropoff
+backwards. Nothing is picked up: no `SELECT_TOOL`, the toolchanger keeps "no tool", no `error_gcode`, no AFC event. The
+moves are the G-code lines of the stock `pickup_gcode`; `DRY_RUN=1` prints them. The path needs a `verify` waypoint
+that is reached by a vertical move.
+
+The accelerometer of the tool sees the contact as one or more knocks. The first lift runs at path speed and shows where
+they are; the later ones go slowly (`seat_speed`, 2 mm/s) through the last `seat_zone` (1.5 mm) up to the verify
+waypoint. A knock is timed against the known move of the shuttle, so its height comes out in mm (resolution about
+0.01 mm). Per position (the park position, then `seat_step` steps along X and Y up to `seat_range`) the result file
+lists the heights of the first and the last knock, their strength, the share of the energy in x and y and the net
+velocity change in x and y with its sign.
+
+* **Z:** the last knock is the seating. The path continues up to the verify waypoint, so the distance between the two is
+  how far the path pushes beyond the contact. Set `params_park_z` so that this distance is what you want.
+* **XY:** a tool that is guided sideways shows a lateral share and a sign. Where the lateral share is smallest and the
+  sign changes, the pins find their holes without being pushed. Whether this gives a clean answer on your machine has
+  to be looked at in the first maps; nothing is applied.
+
+Requirements as for the map ([adxl345 T<n>] per tool) and a shuttle that is in front of the docks and empty. The moves
+are not made by `SELECT_TOOL`: be at the machine for the first run.
 
 ## Result file
 
