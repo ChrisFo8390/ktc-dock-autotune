@@ -212,13 +212,14 @@ def build_report(info):
                 lines.append("%+7.3f  %9.3f  %s" % (t['value'] - start, t['value'], 'locked' if t['ok'] else 'FAILED'))
     lines.extend(["", "Data (CSV)"])
     if info['mode'] == 'seat':
-        lines.append("tool,axis,offset_mm,value_mm,pin_ok,pin_total,events,z_main,peak_all_g,energy_g2s,z_first,z_last,"
-                     "peak_first_g,peak_last_g,lateral_share,ix_mm_s,iy_mm_s,release_g")
+        lines.append("tool,axis,offset_mm,value_mm,pin_ok,pin_total,events,z_main,peak_all_g,energy_g2s,wobble_g2s,score,"
+                     "z_first,z_last,peak_first_g,peak_last_g,lateral_share,ix_mm_s,iy_mm_s,release_g")
         for axis in AXES:
             for r in sorted(info.get('seat', {}).get('rows', {}).get(axis, []), key=lambda r: r['offset']):
                 lines.append(','.join('' if v is None else str(v) for v in (
                     tool, axis, r['offset'], r['value'], r['pin'], r['total'], r['events'], r.get('z_main'),
-                    r.get('peak_all'), r.get('energy'), r['z_first'], r['z_last'], r['peak_first'], r['peak_last'],
+                    r.get('peak_all'), r.get('energy'), r.get('wobble'), r.get('score'), r['z_first'], r['z_last'],
+                    r['peak_first'], r['peak_last'],
                     r['lateral'], r['ix'], r['iy'], r['release_g'])))
     else:
         lines.append("tool,axis,offset_mm,value_mm,locked")
@@ -417,7 +418,8 @@ def find_events(samples, t_from, t_to, t_quiet, window=0.05, threshold=0.0, gap=
 
 def seat_row(offset, value, hubs):
     """One position of the seat test: medians over its lifts. hubs: pin (seen at the top), events (z, rel, peak_g,
-    e_x, e_y, e_z, i_x, i_y), release_g, energy_g2s and lift_peak_g (of the whole lift, also below the threshold)"""
+    e_x, e_y, e_z, i_x, i_y), release_g, energy_g2s, wobble_g2s and lift_peak_g (of the whole hub, also below the
+    threshold). The score is energy + wobble: how much the tool moves during the hub"""
     def med(values, digits=3):
         values = [v for v in values if v is not None]
         return round(median(values), digits) if values else None
@@ -438,6 +440,8 @@ def seat_row(offset, value, hubs):
             'z_main': med([e['z'] for e in mains]), 'peak_main': med([e['peak_g'] for e in mains]),
             'peak_first': med([e['peak_g'] for e in firsts]), 'peak_last': med([e['peak_g'] for e in lasts]),
             'energy': med([h.get('energy_g2s') for h in hubs], 4), 'peak_all': med([h.get('lift_peak_g') for h in hubs]),
+            'wobble': med([h.get('wobble_g2s') for h in hubs], 4),
+            'score': med([h['energy_g2s'] + h.get('wobble_g2s', 0.0) for h in hubs if h.get('energy_g2s') is not None], 4),
             'lateral': med(shares),
             'ix': med([sum(e['i_x'] for e in h['events']) for h in hubs if h['events']], 2),
             'iy': med([sum(e['i_y'] for e in h['events']) for h in hubs if h['events']], 2),
@@ -453,20 +457,20 @@ def seat_crossings(rows, key):
 
 def seat_proposal(axis, rows, quiet_part=0.25):
     """
-    The quiet window along one axis: the positions where the lift is clearly calmer than at the others. The measure
-    is the energy of the whole lift (every knock, also the small ones). A position is quiet if its energy is in the
-    lowest quarter between the lowest and the highest one. The window is a run of quiet positions with a louder one on
+    The quiet window along one axis: the positions where the tool is clearly calmer than at the others. The measure
+    is the score of the whole hub (every knock, also the small ones, and the wobble in the dock). A position is quiet
+    if its score is in the lowest quarter between the lowest and the highest one. The window is a run of quiet positions with a louder one on
     both sides; its centre is suggested. Returns state (ok, open, flat, no data), offset and value of the centre,
     the edges, and a text.
     """
-    points = sorted((r['offset'], r['energy'], r['value']) for r in rows if r.get('energy') is not None)
+    points = sorted((r['offset'], r['score'], r['value']) for r in rows if r.get('score') is not None)
     if len(points) < 4:
         return {'state': 'no data', 'text': 'too few positions measured', 'value': None}
     energies = [e for _, e, _ in points]
     low, high = min(energies), max(energies)
     if high < 2.0 * low:
         return {'state': 'flat', 'value': None,
-                'text': 'no clear difference between the positions (energy %.3f .. %.3f)' % (low, high)}
+                'text': 'no clear difference between the positions (score %.3f .. %.3f)' % (low, high)}
     level = low + quiet_part * (high - low)
     runs, start = [], None
     for i, (_, e, _) in enumerate(points + [(0, high + 1, 0)]):
@@ -511,8 +515,8 @@ def seat_suggestions(seat, tool):
     ok = [a for a in 'xy' if proposals.get(a) and proposals[a]['value'] is not None]
     if not lines:
         return []
-    out = ["Suggested park positions (nothing is applied). The quiet window is the range of positions without a "
-           "clear knock:"] + lines
+    out = ["Suggested park positions (nothing is applied). The quiet window is the range of positions where the "
+           "tool does not move:"] + lines
     if ok:
         out.append("To try them without editing the tool file, then run the seat test again around the new position:")
         out.extend("  SET_TOOL_PARAMETER T=%d PARAMETER=params_park_%s VALUE=%.3f" % (tool, a, proposals[a]['value'])
@@ -547,19 +551,19 @@ def seat_summary(seat):
 
 def seat_table(tool, axis, rows, window):
     """The seat test of one axis as text lines"""
-    lines = ["Seat test T%d %s: the lift into the shuttle at positions along the axis (g after a %d ms high-pass; "
-             "z of the strongest knock in mm; energy = of the whole lift, g^2 s; lateral = share of the knock energy "
-             "in x and y; ix iy = net velocity change in x and y in mm/s; release = knock while it goes down; "
-             "medians of the repeats)" % (tool, axis.upper(), int(round(window * 1000))),
-             " offset  pin  events   z_main   peak  energy  lateral      ix      iy  release"]
+    lines = ["Seat test T%d %s: the hub into the shuttle at positions along the axis (g after a %d ms high-pass; z of "
+             "the strongest knock in mm; energy = of the whole hub, g^2 s; wobble = sideways, slow, g^2 s; score = "
+             "energy + wobble, the lower the calmer; release = knock while it goes down; medians of the repeats)"
+             % (tool, axis.upper(), int(round(window * 1000))),
+             " offset  pin  events   z_main   peak  energy  wobble   score  release"]
 
     def num(v, fmt):
         return fmt % v if v is not None else ' ' * len(fmt % 0)
     for r in sorted(rows, key=lambda r: r['offset']):
-        lines.append("%+7.2f  %d/%d  %s  %s  %s  %s  %s  %s  %s  %s" % (
+        lines.append("%+7.2f  %d/%d  %s  %s  %s  %s  %s  %s  %s" % (
             r['offset'], r['pin'], r['total'], num(r['events'], '%6.1f'), num(r.get('z_main'), '%8.3f'),
-            num(r.get('peak_all'), '%5.2f'), num(r.get('energy'), '%7.3f'), num(r['lateral'], '%7.2f'),
-            num(r['ix'], '%7.1f'), num(r['iy'], '%7.1f'), num(r['release_g'], '%7.2f')))
+            num(r.get('peak_all'), '%5.2f'), num(r.get('energy'), '%7.3f'), num(r.get('wobble'), '%7.3f'),
+            num(r.get('score'), '%7.3f'), num(r['release_g'], '%7.2f')))
     lines.append("Nothing is changed by the seat test. Pin = lifts for which the tool detection was on at the top.")
     return lines
 
@@ -773,6 +777,7 @@ class DockAutotune:
         # to both sides in seat_step steps with seat_repeats lifts each, a side ends after seat_fail_stop positions
         # in a row where the tool detection was off at the top
         self.adxl_window = config.getfloat('adxl_window', 0.05, above=0.)
+        self.wobble_window = config.getfloat('wobble_window', 0.2, above=0.)
         self.seat_fail_stop = config.getint('seat_fail_stop', 2, minval=1)
         self.seat_speed = config.getfloat('seat_speed', 2., above=0.)
         self.seat_zone = config.getfloat('seat_zone', 1.5, minval=0.)
@@ -1131,14 +1136,18 @@ class DockAutotune:
         events = [dict(e, z=event_height(e['t'], segments), rel=event_height(e['t'], segments) - top_z)
                   for e in events]
         release = knock_metrics(samples, t_hold, t_low, self.adxl_window)
-        energy, lift_peak = 0.0, 0.0
-        part = [sm for sm in samples if t_quiet <= sm[0] <= t_hold]
+        energy, wobble, lift_peak = 0.0, 0.0, 0.0
+        part = [sm for sm in samples if t_quiet <= sm[0] <= t_low]
         if len(part) >= 40:
+            # knocks of the whole hub: the lift, the hold and the way down (a tool that was lifted falls back into
+            # its dock), and the slow sideways wobble of the tool in the dock (x and y after a longer high-pass)
             _, rate, (rx, ry, rz) = residuals(part, self.adxl_window)
             squares = [a * a + b * b + c * c for a, b, c in zip(rx, ry, rz)]
             energy, lift_peak = sum(squares) / rate, math.sqrt(max(squares))
+            _, rate, (wx, wy, _) = residuals(part, self.wobble_window)
+            wobble = sum(a * a + b * b for a, b in zip(wx, wy)) / rate
         return {'pin': pin, 'events': events, 'noise_g': noise, 'limit_g': limit, 'energy_g2s': energy,
-                'lift_peak_g': lift_peak, 'release_g': release['peak_g'] if release else None}
+                'wobble_g2s': wobble, 'lift_peak_g': lift_peak, 'release_g': release['peak_g'] if release else None}
 
     def _seat_position(self, tool, sp, axis, offset, repeats, slow_from):
         dx, dy = (offset, 0.0) if axis == 'x' else (0.0, offset)

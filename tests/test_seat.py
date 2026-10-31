@@ -197,10 +197,11 @@ class Rig:
     """The shuttle: trapezoid moves, and a knock when it rises through the contact heights of the dock"""
 
     def __init__(self, dock, toolhead, contacts=CONTACTS, truth=TRUTH, gain=2.0, knocks=(6.0, 4.0), accel=500.0,
-                 quiet_at_truth=False):
+                 quiet_at_truth=False, wobble=0.0):
         self.dock, self.toolhead, self.contacts, self.truth, self.gain, self.knocks = dock, toolhead, contacts, truth, gain, knocks
         self.accel = accel
         self.quiet_at_truth = quiet_at_truth        # the whole knock gets weaker the nearer the shuttle is
+        self.wobble = wobble                        # g per mm of error: the tool swings sideways (6 Hz) during a lift
         self.pos = [0.0, 100.0, 300.0]
         self.moves = []
         self.mounted = False
@@ -267,6 +268,12 @@ class Rig:
         n = int((end - start) * RATE)
         out = [[start + i / RATE, rnd.gauss(0, 0.03), rnd.gauss(0, 0.03), -1.0 + rnd.gauss(0, 0.03)] for i in range(n)]
         for move in self.moves:
+            if self.wobble and move['p1'][2] > move['p0'][2] and math.dist(move['p0'][:2], move['p1'][:2]) < 1e-9:
+                ex, ey = self.lateral(move['p0'])
+                for i in range(n):
+                    t = start + i / RATE
+                    if move['t0'] <= t <= move['t1']:
+                        out[i][1] += self.wobble * math.hypot(ex, ey) * math.sin(2 * math.pi * 6 * (t - move['t0']))
             for k, z in enumerate(self.contacts):
                 t = self.time_at_height(move, z)
                 if t is None or not start <= t <= end:
@@ -310,7 +317,7 @@ class SeatChip:
 
 def energy_rows(energies, step=0.25, first=None):
     first = -step * (len(energies) // 2) if first is None else first
-    return [{'offset': round(first + i * step, 4), 'value': round(10.0 + first + i * step, 4), 'energy': e}
+    return [{'offset': round(first + i * step, 4), 'value': round(10.0 + first + i * step, 4), 'score': e}
             for i, e in enumerate(energies)]
 
 
@@ -464,6 +471,16 @@ class SeatCommandTests(unittest.TestCase):
         self.assertIn('->  params_park_x: %.3f' % p['value'], text)
         self.assertIn('not changed, the quiet window suggests %.3f' % p['value'], text)
         self.assertIn('No park position was changed.', text)
+
+    def test_the_wobble_of_the_tool_is_measured_and_counts(self):
+        # no knock gets weaker, but the tool swings sideways in proportion to the error: the score sees it
+        self.make()
+        self.rig.wobble = 1.0
+        self.seat(T=2, AXES='x', RANGE=0.5, STEP=0.25, REPEATS=1)
+        rows = {r['offset']: r for r in self.module.seat_info['rows']['x']}
+        self.assertGreater(rows[-0.5]['wobble'], 5 * rows[0.25]['wobble'])        # the dock is 0.2 mm in +x
+        self.assertGreater(rows[-0.5]['score'], rows[-0.5]['energy'])
+        self.assertIn('wobble', self.report()[1])
 
     def test_a_window_outside_of_the_range_is_not_suggested(self):
         self.make()
