@@ -2,6 +2,17 @@
 
 The project is a prototype; the entries explain what changed and why, newest first.
 
+## 2026-10-31 (23:30): control run at the new position, quiet everywhere
+
+The control run at X 3.0 / Y -30.7 (range 0.5 mm, 28 lifts) against the old position X 2.6 / Y -30.1: score 0.074 instead of
+0.320, no knock above 0.7 g (the knock of about 8 g, the fall of the tool into the shuttle, is gone), release knock 1.1 to
+1.4 g instead of 2.4 g. X quiet at every position from 2.5 to 3.5. Y quiet from -30.95 to -30.2, the tool caught only 2 of 3
+times at -31.2.
+
+* An axis that is quiet over the whole measured range now says so ("the edges are farther away than the measured range,
+  the current position is safe, no change needed") instead of "no edge found, move the park position".
+* A position where the tool was caught only some of the lifts is shown as "FAIL: the tool was caught only 2 of 3 times".
+
 ## 2026-10-31 (23:00): a chart instead of tables
 
 The console and the result file were too hard to read. Now every axis is a small chart (offset, position, a bar for how

@@ -339,6 +339,8 @@ class SeatRatingTests(unittest.TestCase):
         text = '\n'.join(seat_chart(0, 'y', rows))
         self.assertIn('T0 Y axis', text)
         self.assertIn('FAIL: the tool was not caught', text)
+        rows[1]['pin'], rows[1]['total'], rows[1]['ok'] = 2, 3, False
+        self.assertIn('FAIL: the tool was caught only 2 of 3 times', '\n'.join(seat_chart(0, 'y', rows)))
         self.assertIn('+0.00     10.000   ###', text)
         self.assertIn('<- current', text)
         rows_only = [line for line in text.splitlines() if line.startswith('  ') and line.strip()[0] in '+-']
@@ -388,11 +390,19 @@ class SeatProposalTests(unittest.TestCase):
         self.assertGreater(p['offset'], 0.2)
         self.assertIn('plus edge was not reached', p['text'])
 
-    def test_quiet_everywhere_has_no_edge(self):
-        p = seat_proposal('x', energy_rows([0.05, 0.06, 0.05, 0.06, 0.05]))
-        self.assertEqual(p['state'], 'open')
-        self.assertIsNone(p['value'])
-        self.assertIn('no edge found', p['text'])
+    def test_quiet_everywhere_keeps_the_position(self):
+        # the control run of the user: X quiet from 2.5 to 3.5, no edge within the range
+        p = seat_proposal('x', energy_rows([0.084, 0.079, 0.074, 0.072, 0.070]))
+        self.assertEqual(p['state'], 'quiet-all')
+        self.assertEqual(p['value'], 10.0)
+        self.assertIn('edges are farther away than the measured range', p['text'])
+        self.assertEqual(p['short'], 'quiet over the whole range, no change')
+
+    def test_a_quiet_run_with_a_failed_end_is_one_sided(self):
+        # the control run of the user in Y: failed at the minus end, quiet up to the plus end
+        p = seat_proposal('y', energy_rows([0.069, 0.07, 0.074, 0.085, 0.079], failed=(0,)))
+        self.assertEqual(p['state'], 'one-sided')
+        self.assertIn('plus edge was not reached', p['text'])
 
     def test_the_tool_was_never_caught(self):
         p = seat_proposal('x', energy_rows([0.05, 0.5, 0.5, 0.5, 0.05], failed=(0, 1, 2, 3, 4)))

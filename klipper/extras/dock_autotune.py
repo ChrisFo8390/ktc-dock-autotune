@@ -198,8 +198,7 @@ def park_section(info):
                      for a, v in changed)
     if not changed:
         if kept:
-            lines.append("The current park position of %s is already in the centre of the quiet window."
-                         % ' and '.join(a for a, _ in kept))
+            lines.append("No change needed for %s." % ' and '.join(a for a, _ in kept))
         else:
             lines.append("No new park position can be suggested." if seat else "No new park position found.")
     return lines
@@ -527,10 +526,14 @@ def seat_chart(tool, axis, rows):
     floor, rated = seat_rate(rows)
     lines = ["T%d %s axis  (bar = how much the tool moved, compared with the calmest position, which scored %s)"
              % (tool, axis.upper(), '%.3f' % floor if floor else '-'), "   offset   position   movement"]
-    words = {'FAIL': 'FAIL: the tool was not caught', 'LOUD': 'LOUD', 'rough': 'rough', 'quiet': 'quiet', '?': ''}
+    words = {'LOUD': 'LOUD', 'rough': 'rough', 'quiet': 'quiet', '?': ''}
     for row, rating, ratio in rated:
         bar = '#' * max(1, min(30, int(round(ratio * 3)))) if ratio else ''
-        lines.append("  %+6.2f  %9.3f   %-30s %s%s" % (row['offset'], row['value'], bar, words[rating],
+        word = words.get(rating)
+        if rating == 'FAIL':
+            word = ('FAIL: the tool was caught only %d of %d times' % (row['pin'], row['total'])
+                    if row.get('pin') and row.get('total') else 'FAIL: the tool was not caught')
+        lines.append("  %+6.2f  %9.3f   %-30s %s%s" % (row['offset'], row['value'], bar, word,
                                                          '   <- current' if abs(row['offset']) < 1e-9 else ''))
     return lines
 
@@ -593,6 +596,13 @@ def seat_proposal(axis, rows, tolerance=0.15):
                       'Quiet from %.2f to %.2f, but the %s edge was not reached (at least %.2f mm wide). Centre of '
                       'the measured part %.2f, the real centre is further towards %s.'
                       % (park + minus, park + plus, side, plus - minus, park + centre, side))
+    if runs == [(0, last)]:
+        # every position is quiet: the edges are farther away than the range, the current position is safe
+        return {'state': 'quiet-all', 'offset': 0.0, 'value': round(park, 3), 'minus': points[0][0],
+                'plus': points[-1][0], 'short': 'quiet over the whole range, no change',
+                'text': 'Quiet at every position from %.2f to %.2f: the edges are farther away than the measured '
+                        'range. The current position is safe, no change needed.'
+                        % (park + points[0][0], park + points[-1][0])}
     if runs:
         a, b = max(runs, key=lambda run: points[run[1]][0] - points[run[0]][0])
         return {'state': 'open', 'value': None, 'minus': points[a][0], 'plus': points[b][0],
