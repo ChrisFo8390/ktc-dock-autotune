@@ -43,15 +43,18 @@ class AbortScan(Exception):
 # Pure helpers (no Klipper needed, used by the tests)
 # ---------------------------------------------------------------------------
 
-def scan_axis(trial, step, limit, refine=True):
+def scan_axis(trial, step, limit, refine=True, resolution=None):
     """
     Search the window around offset 0 in which trial(offset) is True (offset 0 must work).
 
     Moves outwards in `step` increments on each side until a trial fails or `limit` is
-    reached. With `refine` one more trial halves the step at the failing edge.
+    reached. With `refine` the interval between the last good and the first failing offset is
+    halved until it is not larger than `resolution` (default: half a step, one extra trial).
     Returns the last good offset on each side and whether the side is still open (no failure
     up to `limit`).
     """
+    if resolution is None:
+        resolution = step / 2.0
     edges = {}
     for sign in (1, -1):
         good, bad, k = 0.0, None, 1
@@ -63,13 +66,20 @@ def scan_axis(trial, step, limit, refine=True):
             else:
                 bad = offset
                 break
-        if bad is not None and refine:
+        while bad is not None and refine and abs(bad - good) > resolution + 1e-9:
             middle = round((good + bad) / 2.0, 6)
-            if abs(middle - good) > 1e-9 and trial(middle):
+            if trial(middle):
                 good = middle
+            else:
+                bad = middle
         edges[sign] = (good, bad is None)
     return {'plus': edges[1][0], 'plus_open': edges[1][1],
             'minus': edges[-1][0], 'minus_open': edges[-1][1]}
+
+
+def describe_edge(offset, is_open):
+    """One side of the window for a message: the edge, or the last offset that still locked"""
+    return '%+.2f mm (open, no failure up to here)' % offset if is_open else '%+.2f mm (edge)' % offset
 
 
 def window_center(edges):
@@ -159,7 +169,8 @@ def detect_setup(settings, commands):
             'has_mesh': has('bed_mesh'), 'max_bed': max_bed, 'can_prepare': not reason, 'reason': reason}
 
 
-def build_plan(setup, bed, soak, touch_cmd, touch_tool, touch_temp, touch_repeats, before_touch=()):
+def build_plan(setup, bed, soak, touch_cmd, touch_tool, touch_temp, touch_repeats, before_touch=(),
+               touch_restore='Z'):
     """The preparation as a list of G-code lines (the PRINT_START up to the preparation of the tools)"""
     plan = ['INITIALIZE_TOOLCHANGER', EMPTY_SHUTTLE]
     if bed > 0 and setup['has_bed']:
@@ -172,7 +183,9 @@ def build_plan(setup, bed, soak, touch_cmd, touch_tool, touch_temp, touch_repeat
     if setup['has_mesh']:
         plan.append('BED_MESH_CLEAR')
     if touch_cmd:
-        plan.append("SELECT_TOOL T=%d %s" % (touch_tool, RESTORE_NONE))
+        # like the T command in a PRINT_START: the pickup brings Z back to where it was before, so the touch homing
+        # does not start at the height of the dock
+        plan.append("SELECT_TOOL T=%d RESTORE_AXIS=%s" % (touch_tool, touch_restore.strip().upper() or "''"))
         if touch_temp > 0:
             plan.append('M104 S%g' % touch_temp)
         plan.extend(before_touch)
@@ -259,6 +272,7 @@ class DockAutotune:
                       'z': config.getfloat('range_z', 0.5, above=0.)}
         self.repeats = config.getint('repeats', 2, minval=1)
         self.refine = config.getboolean('refine', True)
+        self.resolution = config.getfloat('resolution', 0.05, above=0.)
         # Slower than a normal tool change while the scan runs
         self.speed_factor = config.getfloat('speed_factor', 0.5, above=0., maxval=1.)
         self.accel = config.getfloat('accel', 2000., above=0.)
@@ -271,6 +285,7 @@ class DockAutotune:
         self.touch_tool = config.getint('touch_tool', 0, minval=0)
         self.touch_temp = config.getfloat('touch_temp', 150., minval=0.)
         self.touch_repeats = config.getint('touch_repeats', 2, minval=1)
+        self.touch_restore = config.get('touch_restore_axis', 'Z')
         self.before_touch = [l.strip() for l in config.get('before_touch', '').splitlines() if l.strip()]
         # Accelerometer of the tool: "adxl345 T{tool}" (the section must be named per tool)
         self.accel_chip = config.get('accelerometer', 'adxl345 T{tool}')
@@ -380,7 +395,7 @@ class DockAutotune:
         if touch and self.printer.lookup_object('tool T%d' % self.touch_tool, None) is None:
             raise gcmd.error("DOCK_AUTOTUNE: touch homing needs tool T%d (touch_tool)" % self.touch_tool)
         return touch, build_plan(setup, bed, soak, touch, self.touch_tool, self.touch_temp,
-                                 self.touch_repeats, self.before_touch)
+                                 self.touch_repeats, self.before_touch, self.touch_restore)
 
     def _prepare(self, gcmd, plan):
         """Run the plan. A tool on the shuttle is put back first, which needs Z homed or a G28."""
@@ -489,7 +504,7 @@ class DockAutotune:
 
     # -- the scan -----------------------------------------------------------------
 
-    def _scan_tool(self, gcmd, tool, axes, limits, step):
+    def _scan_tool(self, gcmd, tool, axes, limits, step, resolution):
         number = tool.tool_number
         base = {a: float(tool.params['params_park_%s' % a]) for a in axes}
         result = {}
@@ -503,7 +518,7 @@ class DockAutotune:
                                 "adjusted by hand first)" % (axis.upper(), base[axis]))
             self.state['phase'] = 'scan %s' % axis
             edges = scan_axis(lambda offset, a=axis: self._trial(tool, a, base[a] + offset),
-                              step, limits[axis], self.refine)
+                              step, limits[axis], self.refine, resolution)
             center = window_center(edges)
             entry = {'start': base[axis], 'plus': edges['plus'], 'minus': edges['minus'],
                      'plus_open': edges['plus_open'], 'minus_open': edges['minus_open'],
@@ -513,8 +528,11 @@ class DockAutotune:
             if entry['proposal'] is None:
                 # the window is wider than the range: keep the old value for this axis
                 tool.set_parameter('params_park_%s' % axis, base[axis])
-                gcmd.respond_info("dock_autotune T%d %s: no failure within +/-%.2f mm on one side, window "
-                                  "not closed - value kept" % (number, axis.upper(), limits[axis]))
+                gcmd.respond_info("dock_autotune T%d %s: window not closed, value kept. %s side %s, %s side %s. Every "
+                                  "trial up to the open side locked: the window is wider than the range, raise "
+                                  "RANGE (and STEP, for example RANGE=1.2 STEP=0.2)"
+                                  % (number, axis.upper(), '-', describe_edge(edges['minus'], edges['minus_open']),
+                                     '+', describe_edge(edges['plus'], edges['plus_open'])))
             else:
                 self.state['phase'] = 'check %s' % axis
                 if self._trial(tool, axis, entry['proposal']):
@@ -533,7 +551,8 @@ class DockAutotune:
 
     cmd_DOCK_AUTOTUNE_help = ("Find the window in which a tool locks and centre its dock position: "
                               "DOCK_AUTOTUNE T=N [AXES=xyz] [STEP=0.1] [RANGE=MM] [REPEATS=2] "
-                              "[SPEED=0.5] [ADXL=1] [PREPARE=0|1] [BED=70] [SOAK=SECONDS] [TOUCH=0] [DRY_RUN=1]")
+                              "[RESOLUTION=0.05] [SPEED=0.5] [ADXL=1] [PREPARE=0|1] [BED=70] [SOAK=SECONDS] "
+                              "[TOUCH=0] [DRY_RUN=1]")
 
     def cmd_DOCK_AUTOTUNE(self, gcmd):
         if self.active:
@@ -543,6 +562,7 @@ class DockAutotune:
         if not axes:
             raise gcmd.error("AXES must contain x, y or z")
         step = gcmd.get_float('STEP', self.step, above=0.)
+        resolution = gcmd.get_float('RESOLUTION', self.resolution, above=0.)
         limits = dict(self.range)
         if gcmd.get('RANGE', None) is not None:
             limits = {a: gcmd.get_float('RANGE', above=0.) for a in AXES}
@@ -590,7 +610,8 @@ class DockAutotune:
             self._check_state(gcmd, number)
 
         per_axis = {a: int(limits[a] / step + 1e-9) for a in axes}
-        trials = sum(2 * n + (2 if self.refine else 0) + 2 for n in per_axis.values())
+        bisect = max(0, int(math.ceil(math.log(step / resolution, 2) - 1e-9))) if self.refine else 0
+        trials = sum(2 * n + 2 * bisect + 2 for n in per_axis.values())
         gcmd.respond_info("dock_autotune T%d, axes %s, step %.3f mm, range %s, %d repeat(s): about %d trials "
                           "(%d pickups) at most, current dock position x=%.3f y=%.3f z=%.3f"
                           % (number, axes.upper(), step, ' '.join('%s+/-%.2f' % (a, limits[a]) for a in axes),
@@ -619,7 +640,7 @@ class DockAutotune:
             if self._tc_status()['tool_number'] == number:
                 self._run("UNSELECT_TOOL %s" % RESTORE_NONE)
                 self._wait()
-            base, result = self._scan_tool(gcmd, tool, axes, limits, step)
+            base, result = self._scan_tool(gcmd, tool, axes, limits, step, resolution)
             proposals = {a: base[a] for a in axes if result[a]['proposal'] is not None}
             self.result = {'tool': number, 'axes': result}
             self._finish_ok(gcmd, number, originals, proposals, result)
@@ -674,8 +695,13 @@ class DockAutotune:
             if axis in result:
                 e = result[axis]
                 if e['proposal'] is None:
-                    lines.append("  params_park_%s: %.3f   (unchanged, window %s)" % (
-                        axis, originals[axis], 'not closed' if e['plus_open'] or e['minus_open'] else 'centre failed'))
+                    if e['plus_open'] or e['minus_open']:
+                        reason = 'window not closed, at least %.2f mm wide: %s .. %s' % (
+                            e['width'], describe_edge(e['minus'], e['minus_open']),
+                            describe_edge(e['plus'], e['plus_open']))
+                    else:
+                        reason = 'the centre of the window did not lock'
+                    lines.append("  params_park_%s: %.3f   (unchanged, %s)" % (axis, originals[axis], reason))
                 else:
                     lines.append("  params_park_%s: %.3f   (was %.3f, window %.3f wide)" % (
                         axis, e['proposal'], originals[axis], e['width']))

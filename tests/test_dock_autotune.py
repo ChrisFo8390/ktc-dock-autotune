@@ -30,6 +30,19 @@ class ScanAxisTests(unittest.TestCase):
         self.assertFalse(edges['minus_open'] or edges['plus_open'])
         self.assertAlmostEqual(window_center(edges), -0.05)
 
+    def test_bisects_down_to_the_resolution(self):
+        trial = window_trial(-0.35, 0.25)
+        edges = scan_axis(trial, 0.2, 1.0, resolution=0.05)
+        self.assertEqual((edges['minus'], edges['plus']), (-0.35, 0.25))
+        # coarse steps 0.2, 0.4 (bad) then 0.3 (bad), 0.25 (good): 4 trials on the plus side
+        self.assertEqual([o for o in trial.calls if o > 0], [0.2, 0.4, 0.3, 0.25])
+
+    def test_a_coarse_step_without_a_smaller_resolution_halves_once(self):
+        trial = window_trial(-0.35, 0.25)
+        edges = scan_axis(trial, 0.2, 1.0)
+        self.assertEqual(edges['plus'], 0.2)
+        self.assertEqual([o for o in trial.calls if o > 0], [0.2, 0.4, 0.3])
+
     def test_without_refine_the_edge_is_the_last_step(self):
         edges = scan_axis(window_trial(-0.35, 0.25), 0.1, 0.8, refine=False)
         self.assertEqual((edges['minus'], edges['plus']), (-0.3, 0.2))
@@ -151,7 +164,7 @@ class PlanTests(unittest.TestCase):
         plan = plan_of(setup, before=('BRUSH',))
         self.assertEqual(plan, [
             'INITIALIZE_TOOLCHANGER', dock_autotune.EMPTY_SHUTTLE, 'M190 S70', 'G28', 'QUAD_GANTRY_LEVEL',
-            'BED_MESH_CLEAR', "SELECT_TOOL T=0 RESTORE_AXIS=''", 'M104 S150', 'BRUSH', 'M109 S150',
+            'BED_MESH_CLEAR', "SELECT_TOOL T=0 RESTORE_AXIS=Z", 'M104 S150', 'BRUSH', 'M109 S150',
             'CARTOGRAPHER_TOUCH_HOME', 'CARTOGRAPHER_TOUCH_HOME', 'M104 S0', "UNSELECT_TOOL RESTORE_AXIS=''"])
 
     def test_without_touch_the_z_reference_is_taken_again_after_levelling(self):
@@ -524,6 +537,21 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(self.tool.params['params_park_x'], 149.6)
         self.assertIn('unchanged', gcmd.text)
 
+    def test_a_window_wider_than_the_range_says_how_wide_and_what_to_do(self):
+        self.make(window={'x': (-3, 3), 'y': WINDOW['y'], 'z': WINDOW['z']})
+        gcmd = self.scan(T=2, AXES='x', RANGE=0.4)
+        self.assertIn('window not closed, value kept', gcmd.text)
+        self.assertIn('raise RANGE', gcmd.text)
+        self.assertIn('-0.40 mm (open, no failure up to here)', gcmd.text)
+        self.assertIn('at least 0.80 mm wide', gcmd.text)
+        self.assertEqual(self.tool.params['params_park_x'], 149.6)
+
+    def test_coarse_step_and_resolution_find_the_edge_with_few_trials(self):
+        self.make(window={'x': (-0.35, 0.25), 'y': WINDOW['y'], 'z': WINDOW['z']}, hidden=(0, 0, 0))
+        gcmd = self.scan(T=2, AXES='x', RANGE=1.0, STEP=0.2, RESOLUTION=0.05, REPEATS=1)
+        self.assertIn('window -0.350 .. +0.250', gcmd.text)
+        self.assertAlmostEqual(self.tool.params['params_park_x'], 149.55, places=3)
+
     def test_failing_baseline_changes_nothing(self):
         self.make(hidden=(1.5, 0, 0))
         gcmd = self.scan(T=2, RANGE=0.8)
@@ -669,7 +697,7 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn('STOPPED', gcmd.text)
         self.assertEqual(self.dock.scripts[:13], [
             'INITIALIZE_TOOLCHANGER', 'M190 S75', 'G28', 'QUAD_GANTRY_LEVEL', 'BED_MESH_CLEAR',
-            "SELECT_TOOL T=0 RESTORE_AXIS=''", 'M104 S150', 'M109 S150', 'CARTOGRAPHER_TOUCH_HOME',
+            "SELECT_TOOL T=0 RESTORE_AXIS=Z", 'M104 S150', 'M109 S150', 'CARTOGRAPHER_TOUCH_HOME',
             'CARTOGRAPHER_TOUCH_HOME', 'M104 S0', "UNSELECT_TOOL RESTORE_AXIS=''",
             'SET_VELOCITY_LIMIT ACCEL=2000'])
         self.assertTrue(self.dock.scripts[13].startswith('SELECT_TOOL T=2'))
@@ -693,6 +721,16 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(self.dock.scripts[:4], ['INITIALIZE_TOOLCHANGER', 'G28', "UNSELECT_TOOL RESTORE_AXIS=''",
                                                  'M190 S70'])
 
+    def test_the_touch_tool_brings_z_back_like_the_t_command(self):
+        self.make()
+        self.carto()
+        self.scan(T=2, AXES='z', RANGE=0.3, PREPARE=1)
+        self.assertIn("SELECT_TOOL T=0 RESTORE_AXIS=Z", self.dock.scripts)
+        self.make(touch_restore_axis='')
+        self.carto()
+        self.scan(T=2, AXES='z', RANGE=0.3, PREPARE=1)
+        self.assertIn("SELECT_TOOL T=0 RESTORE_AXIS=''", self.dock.scripts)
+
     def test_touch_can_be_turned_off(self):
         self.make()
         self.carto()
@@ -704,7 +742,7 @@ class CommandTests(unittest.TestCase):
         self.make(touch_temp='148', touch_repeats='1', before_touch='BRUSH')
         self.carto()
         self.scan(T=2, AXES='z', RANGE=0.3, PREPARE=1)
-        self.assertEqual(self.dock.scripts[5:11], ["SELECT_TOOL T=0 RESTORE_AXIS=''", 'M104 S148', 'BRUSH',
+        self.assertEqual(self.dock.scripts[5:11], ["SELECT_TOOL T=0 RESTORE_AXIS=Z", 'M104 S148', 'BRUSH',
                                                    'M109 S148', 'CARTOGRAPHER_TOUCH_HOME', 'M104 S0'])
 
     def test_beacon_contact_homing_is_the_touch(self):
@@ -713,7 +751,7 @@ class CommandTests(unittest.TestCase):
                     'z_tilt': {}}, commands=())
         self.scan(T=2, AXES='z', RANGE=0.3, PREPARE=1)
         self.assertEqual(self.dock.scripts[:9], ['INITIALIZE_TOOLCHANGER', 'G28', 'Z_TILT_ADJUST',
-                                                 "SELECT_TOOL T=0 RESTORE_AXIS=''", 'M104 S150', 'M109 S150',
+                                                 "SELECT_TOOL T=0 RESTORE_AXIS=Z", 'M104 S150', 'M109 S150',
                                                  'G28 Z', 'G28 Z', 'M104 S0'])
 
     def test_failure_in_the_preparation_stops_with_a_report(self):

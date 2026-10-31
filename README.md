@@ -14,8 +14,9 @@ window per axis and sets `params_park_x/y/z` of the tool to its centre:
 1. One *trial* is a pickup (`SELECT_TOOL`, the verify at the lock position of the pickup path must see
    the tool) followed by the dropoff (`UNSELECT_TOOL`), `repeats` times. All of them have to lock.
 2. Starting at the current value (it must lock, otherwise the scan stops) the offset is moved outwards
-   in `step` increments on both sides until a trial fails (`range_*` is the limit). One extra trial
-   halves the step at the failing edge.
+   in `step` increments on both sides until a trial fails (`range_*` is the limit). Then the interval between
+   the last good and the first failing offset is halved until it is not larger than `resolution` (for example
+   `STEP=0.2 RESOLUTION=0.05`: two extra trials per edge).
 3. The centre of the window is tried again and, if it locks, applied. The axes are done one after the
    other (x, y, z). If a side did not fail within the range the window is "not closed" and that axis
    is left alone.
@@ -119,8 +120,11 @@ Without `PREPARE` the command shows a prompt and does nothing else:
 * Preparation steps: `INITIALIZE_TOOLCHANGER`; a tool on the shuttle is put back into its dock (with a `G28`
   first if nothing is homed); `M190` to the bed temperature (`SOAK=<s>` waits longer); `G28`; `QUAD_GANTRY_LEVEL`
   (or `Z_TILT_ADJUST`); `BED_MESH_CLEAR`; the touch homing with `touch_tool` (default T0, **only that tool**,
-  it is picked up with `SELECT_TOOL`, not with `T0`, so AFC is not asked to load anything): nozzle to
-  `touch_temp`, `before_touch` (for example `BRUSH`), `touch_repeats` times the touch command, nozzle off,
+  it is picked up with `SELECT_TOOL RESTORE_AXIS=Z`, not with `T0`, so AFC is not asked to load anything and Z
+  comes back to where it was before the pickup, as with the `T` command, instead of staying at the height of the
+  dock, `touch_restore_axis` changes that): nozzle starts heating to `touch_temp`, `before_touch` runs (one G-code
+  line per line of the option: **set your brush macro here**, for example `BRUSH`, it is the place near the brush
+  where the nozzle heats up), wait for the temperature, `touch_repeats` times the touch command, nozzle off,
   tool back into its dock. Without a touch homing the Z zero is taken again with `G28 Z` after the levelling.
   A failure in any step stops everything with a report.
 * If Z cannot be homed with an empty shuttle (the probe sits on a tool: `tool_probe`; or `probe:` is the Z
@@ -135,6 +139,14 @@ At the end the new values are applied until the next restart and printed as `par
 lines. Copy them into `toolchanger/tools/T<n>.cfg`. (`SAVE_TOOL_PARAMETER` plus `SAVE_CONFIG` works too,
 but the line has to be commented out in the cfg first, otherwise Klipper refuses the config.)
 
+**"Window not closed".** If no trial fails on a side within `range_*`, there is no edge there and the axis is
+left alone. The message says how far everything locked (`at least 0.80 mm wide`) and which side is open. The
+window is then wider than the range: run the axis again with a larger range and a coarser step, for example
+`DOCK_AUTOTUNE T=0 AXES=z RANGE=1.2 STEP=0.2` (a failing pickup next to the window is harmless, but watch the
+first runs). A dock with a self-centring coupling can lock over a wide range, and the detection pin only says
+"locked" or "not locked": it does not tell a good position from a worse one inside the window.
+After a preparation the machine stays in the prepared state, so the next run can use `PREPARE=0`.
+
 Every failing trial prints a red `Expected tool ... but active is None` in the console. That is expected,
 it is how the edge of the window is found.
 
@@ -142,7 +154,7 @@ it is how the edge of the window is found.
 |---|---|
 | `T=<n>` | tool, required |
 | `AXES=xyz` | axes to tune, default all |
-| `STEP=0.1`, `RANGE=<mm>`, `RANGE_X/Y/Z=<mm>` | override `step` and `range_*` |
+| `STEP=0.1`, `RESOLUTION=0.05`, `RANGE=<mm>`, `RANGE_X/Y/Z=<mm>` | override `step`, `resolution` and `range_*` |
 | `REPEATS=2` | pickups per candidate |
 | `SPEED=0.5` | factor on `params_path_speed` while scanning |
 | `ADXL=1` | record the accelerometer of the tool (`[adxl345 T<n>]`) |
