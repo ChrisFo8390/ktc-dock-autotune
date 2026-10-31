@@ -467,7 +467,7 @@ class SeatCommandTests(unittest.TestCase):
         self.assertIn('SET_TOOL_PARAMETER T=2 PARAMETER=params_park_x VALUE=%.3f' % p['value'], gcmd.text)
         self.assertEqual(self.tool.params['params_park_x'], 149.6)
         text = self.report()[1]
-        self.assertIn('Suggested new park positions (nothing is applied', text)
+        self.assertIn('Suggested new park positions (copy them into', text)
         self.assertIn('  params_park_x: %.3f' % p['value'], text)
         self.assertIn('%10.3f   quiet from' % p['value'], text)
         self.assertNotIn('changed', text)

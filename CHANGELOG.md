@@ -2,6 +2,14 @@
 
 The project is a prototype; the entries explain what changed and why, newest first.
 
+## 2026-10-31 (night): wording of the console and the result files
+
+* The park positions are listed as **current** and **new** (the scan applies the new value until the next restart, the seat
+  test only suggests one). A missing value says why: "no suggestion: quiet from +0.25 to +1.00 mm but no louder position on
+  the plus side within the range: raise seat_range", "no new value: window not closed". The lines "nothing was changed" /
+  "No park position was changed" are gone; the section ends with "Suggested new park positions" and the lines for the tool
+  file (and `SET_TOOL_PARAMETER` lines for the seat test), or with "No new park position can be suggested." / "found".
+
 ## 2026-10-31 (night): end position
 
 * After a successful run (one tool or several) the shuttle goes without a tool to the centre of the bed and Z 15 (`end_z`)

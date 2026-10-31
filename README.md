@@ -211,8 +211,8 @@ Every run that took measurements writes one text file to `printer_data/config/do
 * `tools_seat_….txt`, `tools_scan_….txt` for several: how each tool ended, the park positions of all tools (before,
   after) with the lines for the tool files, and below that the full report of every tool.
 
-A report holds the status (finished, or stopped and why), the settings, the **park positions** (before, after and what
-happened to each axis), the measurements (seat: height of the lift and a table per axis; scan: the trials in the order
+A report holds the status (finished, or stopped and why), the settings, the **park positions** (the current and the new
+value of each axis, or why there is none), the measurements (seat: height of the lift and a table per axis; scan: the trials in the order
 they were made) and all numbers as CSV. A run that is stopped writes the file too, with what was measured until then.
 `results_dir:` in `dock_autotune.cfg` changes the folder, an empty value switches the file off. The folder is part of
 the config directory, so a backup of that directory contains the results as well.

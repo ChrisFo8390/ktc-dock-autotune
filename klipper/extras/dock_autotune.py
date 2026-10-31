@@ -183,7 +183,7 @@ def park_section(info):
             (changed if new != current else kept).append((axis, new))
     lines.append("")
     if changed and seat:
-        lines.append("Suggested new park positions (nothing is applied, copy them into toolchanger/tools/T%d.cfg):"
+        lines.append("Suggested new park positions (copy them into toolchanger/tools/T%d.cfg):"
                      % tool)
     elif changed:
         lines.append("New park positions (applied until the next restart, copy them into toolchanger/tools/T%d.cfg):"
@@ -318,7 +318,7 @@ def build_multi_report(runs, numbers, mode, when):
                 kept.append('T%d %s' % (r['number'], axis))
     lines.append("")
     if changed:
-        lines.append("Suggested new park positions (nothing is applied, copy them into the tool files "
+        lines.append("Suggested new park positions (copy them into the tool files "
                      "toolchanger/tools/T0.cfg, T1.cfg, ...):" if seat else
                      "New park positions (applied until the next restart, copy them into the tool files "
                      "toolchanger/tools/T0.cfg, T1.cfg, ...):")
@@ -1203,7 +1203,7 @@ class DockAutotune:
     def _seat_tool(self, gcmd, tool, axes, limits, step, repeats):
         """The seat test: the shuttle goes under the tool, lifts into it up to the verify waypoint and back down,
         for the current dock position (first at path speed, finds the contact) and then for positions along X and
-        Y, slowly through the contact. The tool never leaves its dock. Nothing is applied."""
+        Y, slowly through the contact. The tool never leaves its dock. Suggests park positions, applies none."""
         number = tool.tool_number
         sp = self._seat_params(tool)
         self._seat_start_check(sp)
