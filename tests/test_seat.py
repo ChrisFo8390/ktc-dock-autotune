@@ -467,10 +467,10 @@ class SeatCommandTests(unittest.TestCase):
         self.assertIn('SET_TOOL_PARAMETER T=2 PARAMETER=params_park_x VALUE=%.3f' % p['value'], gcmd.text)
         self.assertEqual(self.tool.params['params_park_x'], 149.6)
         text = self.report()[1]
-        self.assertIn('Suggested park positions (nothing is applied)', text)
-        self.assertIn('->  params_park_x: %.3f' % p['value'], text)
-        self.assertIn('not changed, the quiet window suggests %.3f' % p['value'], text)
-        self.assertIn('No park position was changed.', text)
+        self.assertIn('Suggested new park positions (nothing is applied', text)
+        self.assertIn('  params_park_x: %.3f' % p['value'], text)
+        self.assertIn('%10.3f   quiet from' % p['value'], text)
+        self.assertNotIn('changed', text)
 
     def test_the_wobble_of_the_tool_is_measured_and_counts(self):
         # no knock gets weaker, but the tool swings sideways in proportion to the error: the score sees it
@@ -575,8 +575,9 @@ class SeatCommandTests(unittest.TestCase):
         self.assertIn('Lift into the shuttle: park Z 266.200, verify waypoint at Z 266.200', text)
         self.assertIn('the strongest knock is at Z 264.9', text)
         self.assertIn('Seat test T2 X', text)
-        self.assertIn('height of the contact measured', text)
-        self.assertIn('No park position was changed.', text)
+        self.assertIn('the contact height is given below', text)
+        self.assertIn('No new park position can be suggested.', text)
+        self.assertNotIn('changed', text)
         csv = text.split('Data (CSV)')[1].strip().splitlines()
         self.assertTrue(csv[0].startswith('tool,axis,offset_mm,value_mm,pin_ok'))
         self.assertEqual(len(csv), 1 + 3)

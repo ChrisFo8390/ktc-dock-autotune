@@ -562,7 +562,7 @@ class CommandTests(unittest.TestCase):
         self.make(window={'x': (-3, 3), 'y': WINDOW['y'], 'z': WINDOW['z']})
         gcmd = self.scan(T=2, AXES='x', RANGE=0.5)
         self.assertEqual(self.tool.params['params_park_x'], 149.6)
-        self.assertIn('unchanged', gcmd.text)
+        self.assertIn('no new value', gcmd.text)
 
     def test_a_window_wider_than_the_range_says_how_wide_and_what_to_do(self):
         self.make(window={'x': (-3, 3), 'y': WINDOW['y'], 'z': WINDOW['z']})
@@ -723,7 +723,7 @@ class CommandTests(unittest.TestCase):
         self.assertIn('Dock autotune T2, T3 - scan', text)
         self.assertIn('T2  finished', text)
         self.assertIn('T3  finished', text)
-        self.assertIn('Put these lines into the tool files', text)
+        self.assertIn('New park positions (applied until the next restart', text)
         self.assertIn('  T3:\n    params_park_z:', text)
         self.assertIn('Dock autotune T3 - scan', text)           # the full report of each tool follows
         self.assertEqual(text.count('Scan trials Z'), 2)
@@ -974,7 +974,7 @@ class CommandTests(unittest.TestCase):
         self.make(hidden=(0.0, 0.0, 0.0), window={'x': (-5, 5), 'y': (-5, 5), 'z': (-5, 5)})
         self.scan(T=2, AXES='z', RANGE=0.4, STEP=0.2)
         text = self.report()[1]
-        self.assertIn('No park position was changed.', text)
+        self.assertIn('No new park position found.', text)
         self.assertIn('window not closed', text)
 
     def test_no_result_file_without_a_folder_or_without_data(self):

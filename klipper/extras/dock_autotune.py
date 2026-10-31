@@ -144,60 +144,79 @@ def median(values):
 
 
 def _park_result(axis, info):
-    """(after value, text) of one axis for the report"""
-    before = info['originals'][axis]
+    """(new value or None, text) of one axis for the report: the value the scan applied, or the seat test suggests"""
     entry = info.get('scan', {}).get(axis)
     if info['mode'] == 'seat':
+        seat = info.get('seat') or {}
         if axis == 'z':
-            return before, 'height of the contact measured, not changed by the seat test'
-        proposal = (info.get('seat') or {}).get('proposals', {}).get(axis)
+            return None, 'no suggestion for Z; the contact height is given below'
+        proposal = seat.get('proposals', {}).get(axis)
         if proposal and proposal['value'] is not None:
-            return before, 'not changed, the quiet window suggests %.3f' % proposal['value']
-        return before, ('measured, not changed by the seat test' if axis in info.get('seat', {}).get('rows', {})
-                        else 'not measured')
+            return proposal['value'], proposal['text']
+        if proposal:
+            return None, 'no suggestion: ' + proposal['text']
+        return None, ('no suggestion yet, the axis was not finished' if axis in seat.get('rows', {})
+                      else 'not measured')
     if info.get('new', {}).get(axis) is not None:
         return info['new'][axis], 'centred, window %+.3f .. %+.3f mm (%.3f wide)' % (
             entry['minus'], entry['plus'], entry['width'])
     if entry is None:
-        return before, 'not tuned' if not info['status'].startswith('STOPPED') else 'no result'
+        return None, 'not tuned' if not info['status'].startswith('STOPPED') else 'no result'
     if entry['plus_open'] or entry['minus_open']:
-        return before, 'unchanged, window not closed (at least %.2f mm wide: %s .. %s)' % (
+        return None, 'no new value: window not closed (at least %.2f mm wide: %s .. %s)' % (
             entry['width'], describe_edge(entry['minus'], entry['minus_open']),
             describe_edge(entry['plus'], entry['plus_open']))
-    return before, 'unchanged, the centre of the window did not lock'
+    return None, 'no new value: the centre of the window did not lock'
+
+
+def park_section(info):
+    """The park positions of one tool as lines: the current and the new value of every axis, then the lines for the
+    tool file (a scan has applied them until the next restart, the seat test only suggests them)"""
+    tool, seat = info['tool'], info['mode'] == 'seat'
+    lines = ["Park positions of T%d" % tool, "  axis     current         new   result"]
+    changed, kept = [], []
+    for axis in AXES:
+        new, text = _park_result(axis, info)
+        current = info['originals'][axis]
+        lines.append("  %-4s %10.3f  %10s   %s" % (axis, current, '%.3f' % new if new is not None else '-', text))
+        if new is not None:
+            (changed if new != current else kept).append((axis, new))
+    lines.append("")
+    if changed and seat:
+        lines.append("Suggested new park positions (nothing is applied, copy them into toolchanger/tools/T%d.cfg):"
+                     % tool)
+    elif changed:
+        lines.append("New park positions (applied until the next restart, copy them into toolchanger/tools/T%d.cfg):"
+                     % tool)
+    lines.extend("  params_park_%s: %.3f" % c for c in changed)
+    if changed and seat:
+        lines.append("To try them first, without editing the tool file, and to measure again around the new "
+                     "position:")
+        lines.extend("  SET_TOOL_PARAMETER T=%d PARAMETER=params_park_%s VALUE=%.3f" % (tool, a, v)
+                     for a, v in changed)
+    if not changed:
+        if kept:
+            lines.append("The current park position of %s is already in the centre of the quiet window."
+                         % ' and '.join(a for a, _ in kept))
+        else:
+            lines.append("No new park position can be suggested." if seat else "No new park position found.")
+    return lines
 
 
 def build_report(info):
     """
-    The result file of one run as text: the park positions (before, after), the measurements of the seat test or the
+    The result file of one run as text: the park positions (current, new), the measurements of the seat test or the
     trials of the scan, and all numbers as CSV. info: time, tool, mode, status, pickups, settings (list of text),
     originals, new, scan (result per axis), trials, seat (rows per axis and the height of the lift), window
     """
     tool = info['tool']
     lines = ["Dock autotune T%d - %s - %s" % (tool, 'seat test' if info['mode'] == 'seat' else 'scan', info['time']),
              "Status: %s (%d %s)" % (info['status'], info['pickups'], 'lifts' if info['mode'] == 'seat' else 'pickups'),
-             "Settings: " + ', '.join(info['settings']), "",
-             "Park positions of T%d" % tool,
-             "  axis      before       after   result"]
-    changed = []
-    for axis in AXES:
-        after, text = _park_result(axis, info)
-        lines.append("  %-4s %10.3f  %10.3f   %s" % (axis, info['originals'][axis], after, text))
-        if after != info['originals'][axis]:
-            changed.append("params_park_%s: %.3f" % (axis, after))
-    lines.append("")
-    if changed:
-        lines.append("Put these lines into toolchanger/tools/T%d.cfg (applied until the next restart):" % tool)
-        lines.extend("  " + c for c in changed)
-    else:
-        lines.append("No park position was changed.")
+             "Settings: " + ', '.join(info['settings']), ""]
+    lines.extend(park_section(info))
     if info.get('seat'):
         lines.append("")
         lines.extend(seat_summary(info['seat']))
-        suggestions = seat_suggestions(info['seat'], tool)
-        if suggestions:
-            lines.append("")
-            lines.extend(suggestions)
         for axis in AXES:
             if info['seat']['rows'].get(axis):
                 lines.append("")
@@ -274,44 +293,48 @@ def build_multi_report(runs, numbers, mode, when):
     """The result file of a run over several tools: how each tool ended, the park positions of all of them (and
     the lines for the tool files), then the full report of every tool. runs: number, status, info (or None)"""
     names = {'seat': 'seat test'}
+    seat = mode == 'seat'
     lines = ["Dock autotune %s - %s - %s" % (', '.join('T%d' % n for n in numbers), names.get(mode, 'scan'), when),
              "Tools:"]
     done = {r['number']: r for r in runs}
     for n in numbers:
         lines.append("  T%-2d %s" % (n, done[n]['status'] if n in done else 'not run'))
-    lines.extend(["", "Park positions" + (" (applied until the next restart)" if mode == 'scan' else ""),
-                  "  tool  axis      before       after   result"])
-    changed = {}
+    lines.extend(["", "Park positions" + ("" if seat else " (new values applied until the next restart)"),
+                  "  tool  axis     current         new   result"])
+    changed, kept = {}, []
     for r in runs:
         info = r.get('info')
         if not info:
             lines.append("  T%-3d no result (%s)" % (r['number'], r['status']))
             continue
         for axis in AXES:
-            after, text = _park_result(axis, info)
-            lines.append("  T%-3d %-4s %10.3f  %10.3f   %s" % (r['number'], axis, info['originals'][axis], after, text))
-            if after != info['originals'][axis]:
-                changed.setdefault(r['number'], []).append("params_park_%s: %.3f" % (axis, after))
+            new, text = _park_result(axis, info)
+            current = info['originals'][axis]
+            lines.append("  T%-3d %-4s %10.3f  %10s   %s" % (r['number'], axis, current,
+                                                            '%.3f' % new if new is not None else '-', text))
+            if new is not None and new != current:
+                changed.setdefault(r['number'], []).append((axis, new))
+            elif new is not None:
+                kept.append('T%d %s' % (r['number'], axis))
     lines.append("")
     if changed:
-        lines.append("Put these lines into the tool files (toolchanger/tools/T0.cfg, T1.cfg, ...):")
+        lines.append("Suggested new park positions (nothing is applied, copy them into the tool files "
+                     "toolchanger/tools/T0.cfg, T1.cfg, ...):" if seat else
+                     "New park positions (applied until the next restart, copy them into the tool files "
+                     "toolchanger/tools/T0.cfg, T1.cfg, ...):")
         for n in sorted(changed):
             lines.append("  T%d:" % n)
-            lines.extend("    " + c for c in changed[n])
+            lines.extend("    params_park_%s: %.3f" % c for c in changed[n])
+        if seat:
+            lines.append("To try them first, without editing the tool files, and to measure again around the new "
+                         "positions:")
+            for n in sorted(changed):
+                lines.extend("  SET_TOOL_PARAMETER T=%d PARAMETER=params_park_%s VALUE=%.3f" % (n, a, v)
+                             for a, v in changed[n])
     else:
-        lines.append("No park position was changed.")
-    suggested = [(r['number'], r['info']['seat']) for r in runs
-                 if r.get('info') and r['info'].get('seat') and r['info']['seat'].get('proposals')]
-    if suggested:
-        lines.extend(["", "Suggested by the quiet windows of the seat test (nothing is applied, run the seat test again "
-                          "around a new position):"])
-        for n, seat in suggested:
-            for axis in 'xy':
-                p = seat['proposals'].get(axis)
-                if p and p['value'] is not None:
-                    lines.append("  T%d params_park_%s: %.3f   (%s)" % (n, axis, p['value'], p['text']))
-                elif p:
-                    lines.append("  T%d %s: %s" % (n, axis, p['text']))
+        lines.append("No new park position can be suggested." if seat else "No new park position found.")
+    if kept:
+        lines.append("Already in the centre of the quiet window: %s." % ', '.join(kept))
     for r in runs:
         if r.get('info'):
             lines.extend(["", "=" * 78, ""] + build_report(r['info']).rstrip('\n').splitlines())
@@ -514,27 +537,6 @@ def seat_proposal(axis, rows, quiet_part=0.25):
                     'seat_range' % (points[a][0], points[b][0], ' and '.join(sides))}
 
 
-def seat_suggestions(seat, tool):
-    """Lines with the park positions that the quiet windows suggest, and how to try them (nothing is applied)"""
-    proposals = seat.get('proposals') or {}
-    lines = []
-    for axis in 'xy':
-        p = proposals.get(axis)
-        if p:
-            lines.append("  %s: %s%s" % (axis, p['text'], ('  ->  params_park_%s: %.3f' % (axis, p['value']))
-                                         if p['value'] is not None else ''))
-    ok = [a for a in 'xy' if proposals.get(a) and proposals[a]['value'] is not None]
-    if not lines:
-        return []
-    out = ["Suggested park positions (nothing is applied). The quiet window is the range of positions where the "
-           "tool does not move:"] + lines
-    if ok:
-        out.append("To try them without editing the tool file, then run the seat test again around the new position:")
-        out.extend("  SET_TOOL_PARAMETER T=%d PARAMETER=params_park_%s VALUE=%.3f" % (tool, a, proposals[a]['value'])
-                   for a in ok)
-    return out
-
-
 def seat_summary(seat):
     """Lines about the height of the lift: where it knocks, how far below the verify waypoint"""
     rows = [r for axis in AXES for r in seat['rows'].get(axis, [])]
@@ -575,7 +577,7 @@ def seat_table(tool, axis, rows, window):
             r['offset'], r['pin'], r['total'], num(r['events'], '%6.1f'), num(r.get('z_main'), '%8.3f'),
             num(r.get('peak_all'), '%5.2f'), num(r.get('energy'), '%7.3f'), num(r.get('wobble'), '%7.3f'),
             num(r.get('score'), '%7.3f'), num(r['release_g'], '%7.2f')))
-    lines.append("Nothing is changed by the seat test. Pin = lifts for which the tool detection was on at the top.")
+    lines.append("Pin = lifts for which the tool detection was on at the top.")
     return lines
 
 
@@ -719,8 +721,8 @@ def build_prompt(number, params, setup, plan, bed, touch_cmd):
     return out
 
 
-MODE_TEXTS = {'seat': 'seat test (the shuttle lifts into the tool without taking it out of its dock, nothing is '
-                      'changed)',
+MODE_TEXTS = {'seat': 'seat test (the shuttle lifts into the tool without taking it out of its dock and suggests a '
+                      'better park position)',
               'scan': 'scan (finds the window in which the tool locks and centres the dock position)'}
 
 
@@ -1265,7 +1267,9 @@ class DockAutotune:
                 logging.exception("dock_autotune: the shuttle could not leave the dock")
             raise
         self._seat_leave(sp)
-        gcmd.respond_info('\n'.join(seat_summary(info) + seat_suggestions(info, number)))
+        view = {'tool': number, 'mode': 'seat', 'status': 'finished', 'seat': info,
+                'originals': {'x': sp['x'], 'y': sp['y'], 'z': sp['z']}}
+        gcmd.respond_info('\n'.join(seat_summary(info) + [''] + park_section(view)))
         return sp
 
     # -- commands -------------------------------------------------------------------
@@ -1503,8 +1507,7 @@ class DockAutotune:
             if mode == 'seat':
                 self._seat_tool(gcmd, tool, axes, limits, step, repeats)
                 self.result = {'tool': number, 'seat': self.seat_rows}
-                gcmd.respond_info("dock_autotune T%d seat test finished after %d lifts, the park values are "
-                                  "unchanged" % (number, self.cycles))
+                gcmd.respond_info("dock_autotune T%d seat test finished after %d lifts" % (number, self.cycles))
             else:
                 base, result = self._scan_tool(gcmd, tool, axes, limits, step, resolution)
                 proposals = {a: base[a] for a in axes if result[a]['proposal'] is not None}
@@ -1632,7 +1635,8 @@ class DockAutotune:
 
     def _finish_ok(self, gcmd, number, originals, proposals, result):
         lines = ["dock_autotune T%d finished after %d pickups. %s" % (
-            number, self.cycles, "Applied until the next restart:" if proposals else "Nothing was changed:")]
+            number, self.cycles, "New park positions (applied until the next restart):" if proposals
+            else "No new park position found:")]
         for axis in AXES:
             if axis in result:
                 e = result[axis]
@@ -1643,12 +1647,12 @@ class DockAutotune:
                             describe_edge(e['plus'], e['plus_open']))
                     else:
                         reason = 'the centre of the window did not lock'
-                    lines.append("  params_park_%s: %.3f   (unchanged, %s)" % (axis, originals[axis], reason))
+                    lines.append("  %s: no new value (%s)" % (axis, reason))
                 else:
                     lines.append("  params_park_%s: %.3f   (was %.3f, window %.3f wide)" % (
                         axis, e['proposal'], originals[axis], e['width']))
         if proposals:
-            lines.append("Copy the changed lines into toolchanger/tools/T%d.cfg (or SAVE_TOOL_PARAMETER T=%d "
+            lines.append("Copy these lines into toolchanger/tools/T%d.cfg (or SAVE_TOOL_PARAMETER T=%d "
                          "PARAMETER=params_park_x ..., comment the line out in the cfg, SAVE_CONFIG)" % (number, number))
         gcmd.respond_info('\n'.join(lines))
         self._log({'tool': number, 'summary': {a: result[a] for a in result}})
