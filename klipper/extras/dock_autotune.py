@@ -915,7 +915,8 @@ class DockAutotune:
         self.state.update({'tool': number, 'axis': None, 'phase': 'start', 'trial': 0, 'message': ''})
 
     def _finish_ok(self, gcmd, number, originals, proposals, result):
-        lines = ["dock_autotune T%d finished after %d pickups. Applied until the next restart:" % (number, self.cycles)]
+        lines = ["dock_autotune T%d finished after %d pickups. %s" % (
+            number, self.cycles, "Applied until the next restart:" if proposals else "Nothing was changed:")]
         for axis in AXES:
             if axis in result:
                 e = result[axis]
@@ -930,8 +931,9 @@ class DockAutotune:
                 else:
                     lines.append("  params_park_%s: %.3f   (was %.3f, window %.3f wide)" % (
                         axis, e['proposal'], originals[axis], e['width']))
-        lines.append("Copy the changed lines into toolchanger/tools/T%d.cfg (or SAVE_TOOL_PARAMETER T=%d "
-                     "PARAMETER=params_park_x ..., comment the line out in the cfg, SAVE_CONFIG)" % (number, number))
+        if proposals:
+            lines.append("Copy the changed lines into toolchanger/tools/T%d.cfg (or SAVE_TOOL_PARAMETER T=%d "
+                         "PARAMETER=params_park_x ..., comment the line out in the cfg, SAVE_CONFIG)" % (number, number))
         gcmd.respond_info('\n'.join(lines))
         self._log({'tool': number, 'summary': {a: result[a] for a in result}})
 
