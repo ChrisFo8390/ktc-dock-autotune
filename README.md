@@ -250,6 +250,10 @@ it: Mainsail leaves such macros out of its list. Add the macro to a group under 
 | Scan stops: "does not know the scan mode" | the `error_gcode` pauses: use the handler from `examples/` |
 | Touch homing starts at the height of the dock | `touch_restore_axis: Z` (default) brings Z back after the pickup |
 
+## Changes
+
+What changed and why is in [CHANGELOG.md](CHANGELOG.md).
+
 ## Tests
 
 ```
