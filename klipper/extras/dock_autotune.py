@@ -230,6 +230,17 @@ def build_report(info):
     return '\n'.join(lines) + '\n'
 
 
+def parse_pair(value):
+    """(x, y) from a tuple, a list or a text like '20, 20' (as the parsed config has it), None if it is none of them"""
+    try:
+        if isinstance(value, str):
+            value = value.replace(',', ' ').split()
+        x, y = (float(v) for v in value[:2])
+        return x, y
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
 def parse_tool_list(text, known=None):
     """'0,2', '0-4' or 'all' (every number in `known`) -> tool numbers in the order given, without repeats"""
     text = text.strip().lower()
@@ -791,6 +802,12 @@ class DockAutotune:
             raise config.error("dock_autotune: mode must be seat or scan")
         self.axes = ''.join(a for a in config.get('axes', AXES).lower() if a in AXES) or AXES
         self.tools_default = config.get('tools', '').strip()
+        # where the shuttle goes without a tool when everything is done: the bed centre (from [bed_mesh]) and
+        # end_z, or end_x / end_y; end_move: False leaves it at safe Y
+        self.end_move = config.getboolean('end_move', True)
+        self.end_x = self._optional_float(config.get('end_x', ''))
+        self.end_y = self._optional_float(config.get('end_y', ''))
+        self.end_z = config.getfloat('end_z', 15.)
         prepare = config.get('prepare', 'ask').strip().lower()
         if prepare not in PREPARE_CHOICES:
             raise config.error("dock_autotune: prepare must be ask, yes or no")
@@ -821,6 +838,11 @@ class DockAutotune:
         # 'INTERRUPT' in the name: Klipper runs it without waiting for the running scan
         self.gcode.register_command('DOCK_AUTOTUNE_INTERRUPT', self.cmd_INTERRUPT,
                                     desc="Stop a running DOCK_AUTOTUNE after the current trial")
+
+    @staticmethod
+    def _optional_float(text):
+        text = text.strip()
+        return float(text) if text else None
 
     @staticmethod
     def _has_macro(config, name):
@@ -1402,15 +1424,17 @@ class DockAutotune:
                     '\n  '.join(leave))
             if multi:
                 gcmd.respond_info("DRY_RUN: the tools %s would be done one after the other (each one starts at safe "
-                                  "Y); then the shuttle goes back to where the toolhead stood, and one result file "
-                                  "holds the park positions of all tools" % label)
+                                  "Y), and one result file holds the park positions of all tools" % label)
+            end = self._end_position() if self.end_move else None
+            gcmd.respond_info("DRY_RUN: at the end the shuttle goes without a tool %s" % (
+                "to X=%.1f Y=%.1f Z=%.1f" % end if end else "nowhere (end_move off, or the bed centre is unknown: set "
+                                                            "end_x and end_y), it stays at safe Y"))
             gcmd.respond_info("DRY_RUN: nothing moved")
             return
         self.repeats, saved_repeats = repeats, self.repeats
         self._start(numbers[0])
         toolhead = self.printer.lookup_object('toolhead')
         saved_accel = toolhead.get_status(self._now())['max_accel']
-        start_position = self._start_position() if multi else None
         runs = []
         try:
             if prepare:
@@ -1431,9 +1455,10 @@ class DockAutotune:
                                      check=prepare or index > 0, runs=runs, save=not multi)
                 if run['status'] != 'finished':
                     break
-            if multi and len(runs) == len(numbers) and all(r['status'] == 'finished' for r in runs):
-                self.result = {'tools': {r['number']: r['result'] for r in runs}}
-                self._return_to_start(gcmd, start_position, tools[-1])
+            if len(runs) == len(numbers) and all(r['status'] == 'finished' for r in runs):
+                if multi:
+                    self.result = {'tools': {r['number']: r['result'] for r in runs}}
+                self._go_to_end(gcmd, tools[-1])
         except AbortScan as e:
             self._abort_report(gcmd, self.state['tool'] if self.state['tool'] is not None else label, e)
         except self.gcode.error as e:
@@ -1534,27 +1559,50 @@ class DockAutotune:
             return None
         return path
 
-    def _start_position(self):
-        """Where the toolhead stands, None if the machine is not homed"""
-        status = self.printer.lookup_object('toolhead').get_status(self._now())
-        if all(a in status['homed_axes'] for a in 'xyz'):
-            return list(status['position'][:3])
-        return None
+    def _end_position(self):
+        """(x, y, z) where the shuttle goes when everything is done: end_x / end_y, or the centre of the bed (from
+        [bed_mesh], else of the axes), and end_z. None if the centre is not known."""
+        x, y = self.end_x, self.end_y
+        if x is None or y is None:
+            centre = self._bed_centre()
+            if centre is None:
+                return None
+            x = centre[0] if x is None else x
+            y = centre[1] if y is None else y
+        return x, y, self.end_z
 
-    def _return_to_start(self, gcmd, position, tool):
-        """Without a tool on the shuttle back to where the toolhead stood before the run: sideways at the height of
-        the docks first, then down (not nearer to the docks than close Y)"""
-        if position is None:
-            gcmd.respond_info("dock_autotune: the machine was not homed before the run, the shuttle stays at safe Y")
+    def _bed_centre(self):
+        configfile = self.printer.lookup_object('configfile', None)
+        if configfile is not None:
+            try:
+                mesh = configfile.get_status(self._now()).get('settings', {}).get('bed_mesh', {})
+                low, high = parse_pair(mesh.get('mesh_min')), parse_pair(mesh.get('mesh_max'))
+                if low and high:
+                    return (low[0] + high[0]) / 2.0, (low[1] + high[1]) / 2.0
+            except Exception:
+                logging.exception("dock_autotune: cannot read [bed_mesh] from the parsed config")
+        try:
+            status = self.printer.lookup_object('toolhead').get_status(self._now())
+            low, high = status['axis_minimum'], status['axis_maximum']
+            return (low[0] + high[0]) / 2.0, (low[1] + high[1]) / 2.0
+        except (KeyError, TypeError, IndexError):
+            return None
+
+    def _go_to_end(self, gcmd, tool):
+        """Without a tool on the shuttle to the end position: sideways at the height of the docks first, then down"""
+        if not self.end_move:
             return
-        close_y = float(tool.params.get('params_close_y', 0.0))
+        end = self._end_position()
+        if end is None:
+            gcmd.respond_info("dock_autotune: done. The bed centre is not known (no [bed_mesh]), set end_x and end_y "
+                              "in dock_autotune.cfg; the shuttle stays at safe Y")
+            return
         fast = float(tool.params.get('params_fast_speed', 6000.0))
         self._run('G90')
-        self._run('G0 X%.3f Y%.3f F%g' % (position[0], max(position[1], close_y), fast))
-        self._run('G0 Z%.3f F%g' % (position[2], 3000.0))
+        self._run('G0 X%.3f Y%.3f F%g' % (end[0], end[1], fast))
+        self._run('G0 Z%.3f F%g' % (end[2], 3000.0))
         self.printer.lookup_object('toolhead').wait_moves()
-        gcmd.respond_info("dock_autotune: all tools done, the shuttle is back at X=%.1f Y=%.1f Z=%.1f"
-                          % (position[0], max(position[1], close_y), position[2]))
+        gcmd.respond_info("dock_autotune: done, the shuttle is at X=%.1f Y=%.1f Z=%.1f without a tool" % end)
 
     def _check_not_printing(self, gcmd):
         stats = self.printer.lookup_object('print_stats', None)

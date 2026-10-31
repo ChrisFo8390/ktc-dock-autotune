@@ -115,10 +115,14 @@ without a probe, legacy `[scanner]`), the prompt says so and only offers to cont
 hand (`PREPARE=0`). After a preparation the machine stays prepared, so the next run can use `PREPARE=0`.
 
 **Several tools.** `TOOLS=0,1,2`, `TOOLS=0-4` or `TOOLS=all` (every tool of the toolchanger). The preparation runs
-once, then the tools follow one after the other, each starting from safe Y. When all are done and the machine was homed
-at the start, the shuttle goes back without a tool to X, Y and Z where the toolhead stood before. If a tool stops
-(error, `DOCK_AUTOTUNE_INTERRUPT`) the run ends there, the remaining tools are listed as "not run" and the shuttle stays
-where it is.
+once, then the tools follow one after the other, each starting from safe Y. If a tool stops (error,
+`DOCK_AUTOTUNE_INTERRUPT`) the run ends there, the remaining tools are listed as "not run" and the shuttle stays where
+it is.
+
+**End of a run.** When everything is done the shuttle goes without a tool to the centre of the bed and Z 15: first
+sideways at the height of the docks, then down. The centre comes from `mesh_min` / `mesh_max` of `[bed_mesh]` (else
+from the axes); `end_x`, `end_y` and `end_z` in `dock_autotune.cfg` set another position, `end_move: False` leaves the
+shuttle at safe Y. After an error or an interrupt it does not move on its own.
 
 | Parameter | |
 |---|---|

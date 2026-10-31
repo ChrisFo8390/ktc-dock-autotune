@@ -740,27 +740,57 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(sum(1 for s in self.dock.scripts if s == 'CARTOGRAPHER_TOUCH_HOME'), 1)
         self.assertEqual(self.dock.scripts.count('SET_VELOCITY_LIMIT ACCEL=2000'), 1)
 
-    def test_the_shuttle_goes_back_to_the_start_without_a_tool(self):
-        self.make()
-        self.add_tool(3)
-        self.scan(TOOLS='2,3', AXES='z', RANGE=0.3)
-        self.assertEqual(self.dock.scripts[-4:-1], ['G90', 'G0 X0.000 Y100.000 F6000', 'G0 Z0.000 F3000'])
-        self.assertTrue(self.dock.scripts[-1].startswith('SET_VELOCITY_LIMIT'))     # the acceleration is put back
-        self.assertEqual(self.dock.mounted, -1)
-        # one tool: where it ends is not touched
-        self.make()
+    MESH = {'bed_mesh': {'mesh_min': (20.0, 20.0), 'mesh_max': (280.0, 280.0)}}
+
+    def test_the_shuttle_goes_to_the_bed_centre_without_a_tool(self):
+        for params in ({'T': 2}, {'TOOLS': '2,3'}):
+            self.make()
+            self.add_tool(3)
+            self.printer.objects['configfile'] = FakeConfigfile(self.MESH)
+            self.scan(AXES='z', RANGE=0.3, **params)
+            self.assertEqual(self.dock.scripts[-4:-1], ['G90', 'G0 X150.000 Y150.000 F6000', 'G0 Z15.000 F3000'])
+            self.assertTrue(self.dock.scripts[-1].startswith('SET_VELOCITY_LIMIT'))     # the acceleration is put back
+            self.assertEqual(self.dock.mounted, -1)
+
+    def test_the_end_position_can_be_set_or_turned_off(self):
+        self.make(end_x='100', end_y='120', end_z='20')
+        self.scan(T=2, AXES='z', RANGE=0.3)
+        self.assertEqual(self.dock.scripts[-3:-1], ['G0 X100.000 Y120.000 F6000', 'G0 Z20.000 F3000'])
+        self.make(end_x='100', end_z='20')                   # y from the mesh
+        self.printer.objects['configfile'] = FakeConfigfile(self.MESH)
+        self.scan(T=2, AXES='z', RANGE=0.3)
+        self.assertEqual(self.dock.scripts[-3:-1], ['G0 X100.000 Y150.000 F6000', 'G0 Z20.000 F3000'])
+        self.make(end_move='False')
+        self.printer.objects['configfile'] = FakeConfigfile(self.MESH)
         self.scan(T=2, AXES='z', RANGE=0.3)
         self.assertFalse(any(s.startswith('G0') for s in self.dock.scripts))
 
-    def test_not_homed_before_the_run_stays_at_safe_y(self):
+    def test_without_a_known_bed_centre_the_shuttle_stays(self):
         self.make()
-        self.add_tool(3)
-        self.printer.objects['toolhead'].homed = ''
-        self.dock.homed = False
-        self.carto()
-        gcmd = self.scan(TOOLS='2,3', AXES='z', RANGE=0.3, PREPARE=1)
-        self.assertIn('was not homed before the run', gcmd.text)
+        gcmd = self.scan(T=2, AXES='z', RANGE=0.3)
+        self.assertIn('The bed centre is not known', gcmd.text)
         self.assertFalse(any(s.startswith('G0') for s in self.dock.scripts))
+
+    def test_the_bed_centre_falls_back_to_the_axes(self):
+        self.make()
+        toolhead = self.printer.objects['toolhead']
+        real = toolhead.get_status
+        toolhead.get_status = lambda t: dict(real(t), axis_minimum=(0.0, -32.0, 0.0, 0.0),
+                                             axis_maximum=(300.0, 280.0, 300.0, 0.0))
+        self.scan(T=2, AXES='z', RANGE=0.3)
+        self.assertIn('G0 X150.000 Y124.000 F6000', self.dock.scripts)
+
+    def test_dry_run_names_the_end_position(self):
+        self.make()
+        self.printer.objects['configfile'] = FakeConfigfile(self.MESH)
+        gcmd = self.scan(T=2, AXES='z', DRY_RUN=1)
+        self.assertIn('at the end the shuttle goes without a tool to X=150.0 Y=150.0 Z=15.0', gcmd.text)
+
+    def test_parse_pair(self):
+        self.assertEqual(dock_autotune.parse_pair((20.0, 30)), (20.0, 30.0))
+        self.assertEqual(dock_autotune.parse_pair('20, 30'), (20.0, 30.0))
+        self.assertIsNone(dock_autotune.parse_pair(None))
+        self.assertIsNone(dock_autotune.parse_pair('x'))
 
     def test_a_stopped_tool_ends_the_run(self):
         # T3 sits 2 mm off, its baseline does not lock: T2 is not run, the shuttle does not move on its own

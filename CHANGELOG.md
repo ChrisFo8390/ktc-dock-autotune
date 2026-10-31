@@ -2,6 +2,14 @@
 
 The project is a prototype; the entries explain what changed and why, newest first.
 
+## 2026-10-31 (night): end position
+
+* After a successful run (one tool or several) the shuttle goes without a tool to the centre of the bed and Z 15 (`end_z`)
+  instead of staying at safe Y: sideways at the height of the docks first, then down. The centre comes from
+  `[bed_mesh]` (`mesh_min` / `mesh_max`), else from the axes; `end_x`, `end_y` override it, `end_move: False` turns it
+  off. After an error or an interrupt the shuttle stays where it is. This replaces the return to where the toolhead stood
+  at the start, which only existed for several tools.
+
 ## 2026-10-31 (evening): the quiet window replaces sign changes and lateral share
 
 **What the first seat test showed** (T0, bed 70 °C, X and Y ±1 mm in 0.25 mm steps, 3 lifts each, 52 lifts):
