@@ -1021,7 +1021,7 @@ class CommandTests(unittest.TestCase):
 
     def test_which_tools(self):
         self.make()
-        for params in ({}, {'T': 2, 'TOOLS': '2,3'}, {'TOOLS': 'x'}, {'TOOLS': '2,9'}):
+        for params in ({'T': 2, 'TOOLS': '2,3'}, {'TOOLS': 'x'}, {'TOOLS': '2,9'}, {'DRY_RUN': 1}):
             with self.assertRaises(CommandError):
                 self.scan(**params)
 
@@ -1040,6 +1040,52 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(len(files), 1)
         with open(os.path.join(self.module.results_dir, files[0])) as f:
             return files[0], f.read()
+
+    # -- the prompt that asks for the tool -------------------------------------------------------
+
+    def test_without_a_tool_a_prompt_asks_for_it(self):
+        self.make()
+        self.add_tool(3)
+        self.module.cmd_DOCK_AUTOTUNE(FakeGcmd())
+        raw = self.printer.objects['gcode'].raw
+        text = '\n'.join(raw)
+        self.assertEqual(raw[0], '// action:prompt_begin Dock autotune')
+        self.assertEqual(raw[-1], '// action:prompt_show')
+        self.assertIn('prompt_button T2|DOCK_AUTOTUNE T=2|info', text)
+        self.assertIn('prompt_button T3|DOCK_AUTOTUNE T=3|info', text)
+        self.assertIn('prompt_button All tools (T2, T3)|DOCK_AUTOTUNE TOOLS=all|warning', text)
+        self.assertIn('Mode: seat test', text)
+        self.assertEqual(self.dock.scripts, [])
+        self.assertFalse(self.module.active)
+
+    def test_the_buttons_keep_the_other_parameters(self):
+        lines = dock_autotune.build_tool_prompt({'MODE': 'scan', 'AXES': 'z'}, [0, 1], 'scan')
+        text = '\n'.join(lines)
+        self.assertIn('T0|DOCK_AUTOTUNE T=0 MODE=scan AXES=z|info', text)
+        self.assertIn('All tools (T0, T1)|DOCK_AUTOTUNE MODE=scan AXES=z TOOLS=all|warning', text)
+        self.assertIn('Mode: scan', text)
+
+    def test_the_tool_prompt_leads_to_the_prepare_prompt(self):
+        self.make()
+        self.add_tool(3)
+        self.carto()
+        # T=3 from the button, no PREPARE: the next prompt asks for the preparation
+        self.module.cmd_DOCK_AUTOTUNE(FakeGcmd(T=3, MODE='scan'))
+        text = '\n'.join(self.printer.objects['gcode'].raw)
+        self.assertIn('prompt_begin Dock autotune T3', text)
+        self.assertIn('DOCK_AUTOTUNE T=3 MODE=scan PREPARE=1', text)
+
+    def test_no_tool_prompt_while_printing_or_with_a_default_tool(self):
+        self.make()
+        self.stats.state = 'printing'
+        with self.assertRaises(CommandError):
+            self.module.cmd_DOCK_AUTOTUNE(FakeGcmd())
+        self.assertEqual(self.printer.objects['gcode'].raw, [])
+        self.make(tools='2')
+        gcmd = FakeGcmd(MODE='scan', PREPARE=0, DRY_RUN=1)
+        self.module.cmd_DOCK_AUTOTUNE(gcmd)
+        self.assertEqual(self.printer.objects['gcode'].raw, [])
+        self.assertIn('T2 scan', gcmd.text)
 
     # -- prompt and default mode ---------------------------------------------------------------
 

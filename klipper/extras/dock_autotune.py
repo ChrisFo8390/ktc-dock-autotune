@@ -710,6 +710,30 @@ def build_prompt(number, params, setup, plan, bed, touch_cmd):
     return out
 
 
+MODE_TEXTS = {'seat': 'seat test (the shuttle lifts into the tool without taking it out of its dock, nothing is '
+                      'changed)',
+              'scan': 'scan (finds the window in which the tool locks and centres the dock position)',
+              'map': 'ADXL map (measures the knock of full pickups, nothing is changed)'}
+
+
+def build_tool_prompt(params, numbers, mode='seat'):
+    """Lines of a Mainsail / Fluidd action prompt that asks which tool to measure: one of the tools, or all"""
+    def line(text):
+        return '// action:' + text.replace('\n', ' ')
+
+    out = [line('prompt_begin Dock autotune'),
+           line('prompt_text Which tool should be measured? Mode: %s.' % MODE_TEXTS.get(mode, mode)),
+           line('prompt_button_group_start')]
+    for number in numbers:
+        out.append(line('prompt_button T%d|%s|info' % (number, command_line(params, T=number))))
+    out.append(line('prompt_button_group_end'))
+    out.append(line('prompt_button All tools (%s)|%s|warning' % (', '.join('T%d' % n for n in numbers),
+                                                                  command_line(params, TOOLS='all'))))
+    out.extend([line('prompt_footer_button Cancel|RESPOND TYPE=command MSG=action:prompt_end|secondary'),
+                line('prompt_show')])
+    return out
+
+
 def plan_touch_tool(plan):
     """Number of the tool the plan uses for the touch homing"""
     for entry in plan:
@@ -1348,9 +1372,31 @@ class DockAutotune:
         except ValueError as e:
             raise gcmd.error("DOCK_AUTOTUNE: %s" % e)
 
+    def _known_tools(self):
+        numbers = self._tc_status().get('tool_numbers') or []
+        if not numbers:
+            numbers = [n for n in range(16) if self.printer.lookup_object('tool T%d' % n, None) is not None]
+        return sorted(numbers)
+
+    def _prompt_tools(self, gcmd):
+        numbers = self._known_tools()
+        if not numbers:
+            raise gcmd.error("DOCK_AUTOTUNE: the toolchanger has no tools")
+        mode = gcmd.get('MODE', self.mode).strip().lower()
+        for text in build_tool_prompt(gcmd.get_command_parameters(), numbers, mode):
+            self.gcode.respond_raw(text)
+        gcmd.respond_info("dock_autotune: choose the tool in the prompt, or call DOCK_AUTOTUNE with T=n (one tool) "
+                          "or TOOLS=0,1,2 / 0-4 / all")
+
     def cmd_DOCK_AUTOTUNE(self, gcmd):
         if self.active:
             raise gcmd.error("DOCK_AUTOTUNE is already running (DOCK_AUTOTUNE_INTERRUPT stops it)")
+        if (gcmd.get('T', None) is None and gcmd.get('TOOLS', None) is None and not self.tools_default
+                and gcmd.get_int('DRY_RUN', 0) != 1):
+            # called from the macro list without a tool: ask in a prompt
+            self._check_not_printing(gcmd)
+            self._prompt_tools(gcmd)
+            return
         numbers = self._tool_numbers(gcmd)
         multi = len(numbers) > 1
         label = numbers[0] if not multi else ', '.join('T%d' % n for n in numbers)

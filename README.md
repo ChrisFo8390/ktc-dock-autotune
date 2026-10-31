@@ -88,6 +88,10 @@ DOCK_AUTOTUNE T=1 MODE=scan                      # scan of x, y and z with the c
 DOCK_AUTOTUNE_INTERRUPT                          # stops after the current trial (M112 stops at once)
 ```
 
+**From the UI.** `DOCK_AUTOTUNE` without `T=` and `TOOLS=` (a click on the macro in Mainsail) opens a prompt: one
+button per tool, and "All tools". The next prompt asks whether to prepare the machine (see "Preparation"). `tools:` in
+`dock_autotune.cfg` sets a default instead, then there is no question.
+
 **Several tools in one run.** `TOOLS=0,1,2`, `TOOLS=0-4` or `TOOLS=all` (every tool of the toolchanger; or `tools:` in
 `dock_autotune.cfg`) instead of `T=`:
 
