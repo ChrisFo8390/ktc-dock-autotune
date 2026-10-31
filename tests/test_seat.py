@@ -336,12 +336,29 @@ class SeatProposalTests(unittest.TestCase):
         self.assertEqual(p['state'], 'ok')
         self.assertAlmostEqual(p['offset'], -0.25 + 0.0, delta=0.13)
 
-    def test_open_window_asks_for_a_larger_range(self):
+    def test_a_window_open_on_one_side_suggests_the_centre_of_the_measured_part(self):
         p = seat_proposal('y', energy_rows([0.05, 0.05, 0.06, 0.07, 0.9, 1.0, 1.0]))      # quiet to the minus end
+        self.assertEqual(p['state'], 'one-sided')
+        self.assertEqual((p['minus'], p['plus']), (-0.75, 0.125))
+        self.assertAlmostEqual(p['offset'], -0.312, places=3)
+        self.assertIn('open on the minus side', p['text'])
+        self.assertIn('further towards minus', p['text'])
+
+    def test_two_quiet_bands_each_open_on_one_side_take_the_wider(self):
+        # the first run of the user: quiet far left (3 positions) and quiet right (4 positions) of a loud band
+        p = seat_proposal('x', energy_rows([0.10, 0.12, 0.12, 0.32, 0.32, 0.09, 0.08, 0.08, 0.09], first=-1.0))
+        self.assertEqual(p['state'], 'one-sided')
+        self.assertGreater(p['offset'], 0.2)
+        self.assertIn('open on the plus side', p['text'])
+
+    def test_no_edge_at_all(self):
+        # quiet at both ends of the range and a louder part in the middle only for one position at the end
+        p = seat_proposal('x', energy_rows([0.05, 0.05, 0.05, 0.5, 0.05, 0.05, 0.05]))
+        self.assertIn(p['state'], ('ok', 'one-sided'))
+        p = seat_proposal('x', energy_rows([0.05, 0.9, 0.9, 0.9, 0.05]))       # single quiet positions at the ends
         self.assertEqual(p['state'], 'open')
         self.assertIsNone(p['value'])
-        self.assertIn('minus side', p['text'])
-        self.assertIn('raise seat_range', p['text'])
+        self.assertIn('no edge found', p['text'])
 
     def test_the_widest_closed_run_wins(self):
         p = seat_proposal('x', energy_rows([1.0, 0.05, 1.0, 0.9, 0.05, 0.06, 0.05, 0.1, 1.0, 1.0], first=-1.0))
@@ -447,7 +464,7 @@ class SeatCommandTests(unittest.TestCase):
     def test_positions_where_the_tool_is_not_detected_end_a_side(self):
         # the tool detection is off from an error of 1.15 mm on, and the dock is 0.2 mm off: +1.5 and +2.0 fail, so
         # +2.5 and +3.0 are skipped; on the other side -1.0 and -1.5 fail, so -2.0 and further are skipped
-        self.make(seat_fail_stop='2')
+        self.make(seat_fail_stop='2', seat_range_limit='5')
         self.seat(T=2, AXES='x', RANGE=3.0, STEP=0.5, REPEATS=1)
         rows = self.module.seat_info['rows']['x']
         offsets = sorted(r['offset'] for r in rows)
@@ -485,13 +502,65 @@ class SeatCommandTests(unittest.TestCase):
     def test_a_window_outside_of_the_range_is_not_suggested(self):
         self.make()
         self.rig.quiet_at_truth = True
-        self.rig.truth = {'x': 151.6, 'y': TRUTH['y']}               # 2 mm away: the range ends before the window
+        self.rig.truth = {'x': 150.8, 'y': TRUTH['y']}               # 1.2 mm away: the range ends before the window
         self.rig.contacts = CONTACTS
         gcmd = self.seat(T=2, AXES='x', RANGE=1.0, STEP=0.25, REPEATS=1)
         p = self.module.seat_info['proposals']['x']
-        self.assertIn(p['state'], ('open', 'flat'))
-        self.assertIsNone(p['value'])
-        self.assertNotIn('SET_TOOL_PARAMETER', gcmd.text)
+        self.assertEqual(p['state'], 'one-sided')                    # the quiet part is cut off by the range
+        self.assertIn('further towards plus', p['text'])
+        self.assertGreater(p['offset'], 0.4)
+
+    def test_a_range_above_the_limit_is_reduced(self):
+        self.make()
+        gcmd = self.seat(T=2, AXES='x', RANGE=2.0, STEP=0.5, REPEATS=1)
+        self.assertIn('X +/-2.00 mm is more than seat_range_limit (1.00 mm)', gcmd.text)
+        offsets = sorted(r['offset'] for r in self.module.seat_info['rows']['x'])
+        self.assertEqual(offsets, [-1.0, -0.5, 0.0, 0.5, 1.0])
+        self.make(seat_range_limit='3')
+        gcmd = self.seat(T=2, AXES='x', RANGE=2.0, STEP=1.0, REPEATS=1)
+        self.assertNotIn('seat_range_limit', gcmd.text)
+
+    def test_the_default_range_is_small(self):
+        self.make()
+        self.assertEqual((self.module.seat_range, self.module.seat_range_limit, self.module.seat_fail_stop),
+                         (0.5, 1.0, 1))
+        self.seat(T=2, AXES='x', REPEATS=1)
+        self.assertEqual(sorted(r['offset'] for r in self.module.seat_info['rows']['x']), [-0.5, -0.25, 0.0, 0.25, 0.5])
+
+    def test_a_side_ends_at_the_first_position_where_the_tool_is_not_detected(self):
+        self.make()
+        self.seat(T=2, AXES='x', RANGE=1.0, STEP=0.25, REPEATS=1)
+        # the detection is off from an error of 1.15 mm: x offset -1.0 fails (error -1.2), the side ends there
+        rows = {r['offset']: r for r in self.module.seat_info['rows']['x']}
+        self.assertIn(-1.0, rows)
+        self.assertFalse(rows[-1.0]['ok'])
+
+    def test_positions_outside_of_the_machine_range_are_left_out(self):
+        self.make(seat_range_limit='5', seat_fail_stop='9')
+        toolhead = self.printer.objects['toolhead']
+        real = toolhead.get_status
+        toolhead.get_status = lambda t: dict(real(t), axis_minimum=(0.0, -31.0, 0.0, 0.0),
+                                             axis_maximum=(300.0, 280.0, 300.0, 0.0))
+        gcmd = self.seat(T=2, AXES='y', RANGE=3.0, STEP=1.0, REPEATS=1)
+        self.assertNotIn('STOPPED', gcmd.text)
+        offsets = sorted(r['offset'] for r in self.module.seat_info['rows']['y'])
+        self.assertEqual(offsets, [-1.0, 0.0, 1.0, 2.0, 3.0])        # park y -29.4: -2.0 would be y -31.4
+        self.assertIn('Y -2.00 mm is outside of the machine range, this side ends here', gcmd.text)
+
+    def test_the_shuttle_leaves_the_dock_after_an_error_of_a_move(self):
+        self.make()
+        real = self.gcode.run_script_from_command
+        calls = []
+
+        def run(script):
+            calls.append(script)
+            if script.startswith('G0 X') and len([c for c in calls if c.startswith('G0 X')]) == 3:
+                raise CommandError('Move out of range')
+            return real(script)
+        self.gcode.run_script_from_command = run
+        with self.assertRaises(CommandError):
+            self.seat(T=2, AXES='x', RANGE=0.5, STEP=0.25, REPEATS=1)
+        self.assertEqual(self.rig.pos[1], 100.0)
 
     def test_z_only(self):
         self.make()

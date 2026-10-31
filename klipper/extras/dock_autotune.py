@@ -526,15 +526,23 @@ def seat_proposal(axis, rows, quiet_part=0.25):
         return {'state': 'ok', 'offset': round(centre, 3), 'value': round(park + centre, 3), 'minus': round(minus, 3),
                 'plus': round(plus, 3), 'text': 'quiet from %+.2f to %+.2f mm around the park position (%.2f mm wide), '
                                                  'centre %+.2f mm' % (minus, plus, plus - minus, centre)}
+    # a run with a louder position on one side only: the other edge is outside of the measured range. The centre of
+    # the measured part is suggested; the real centre lies further towards the open side
+    one_sided = [(a, b) for a, b in runs if b > a and (a == 0) != (b == len(points) - 1)]
+    if one_sided:
+        a, b = max(one_sided, key=lambda run: points[run[1]][0] - points[run[0]][0])
+        side = 'minus' if a == 0 else 'plus'
+        minus, plus = (points[0][0], edge(b, b + 1)) if a == 0 else (edge(a - 1, a), points[-1][0])
+        centre = (minus + plus) / 2.0
+        return {'state': 'one-sided', 'offset': round(centre, 3), 'value': round(park + centre, 3),
+                'minus': round(minus, 3), 'plus': round(plus, 3),
+                'text': 'quiet from %+.2f to %+.2f mm, open on the %s side (not measured further): the centre of the '
+                        'measured part is suggested, the real centre lies further towards %s'
+                        % (minus, plus, side, side)}
     a, b = max(runs, key=lambda run: points[run[1]][0] - points[run[0]][0])
-    sides = []
-    if a == 0:
-        sides.append('minus')
-    if b == len(points) - 1:
-        sides.append('plus')
     return {'state': 'open', 'value': None, 'minus': points[a][0], 'plus': points[b][0],
-            'text': 'quiet from %+.2f to %+.2f mm but no louder position on the %s side within the range: raise '
-                    'seat_range' % (points[a][0], points[b][0], ' and '.join(sides))}
+            'text': 'quiet from %+.2f to %+.2f mm and no louder position within the range: no edge found, move the '
+                    'park position and measure again' % (points[a][0], points[b][0])}
 
 
 def seat_summary(seat):
@@ -791,10 +799,11 @@ class DockAutotune:
         # in a row where the tool detection was off at the top
         self.adxl_window = config.getfloat('adxl_window', 0.05, above=0.)
         self.wobble_window = config.getfloat('wobble_window', 0.2, above=0.)
-        self.seat_fail_stop = config.getint('seat_fail_stop', 2, minval=1)
+        self.seat_fail_stop = config.getint('seat_fail_stop', 1, minval=1)
+        self.seat_range_limit = config.getfloat('seat_range_limit', 1., above=0.)
         self.seat_speed = config.getfloat('seat_speed', 2., above=0.)
         self.seat_zone = config.getfloat('seat_zone', 1.5, minval=0.)
-        self.seat_range = config.getfloat('seat_range', 1., above=0.)
+        self.seat_range = config.getfloat('seat_range', 0.5, above=0.)
         self.seat_step = config.getfloat('seat_step', 0.25, above=0.)
         self.seat_repeats = config.getint('seat_repeats', 3, minval=1)
         self.seat_threshold = config.getfloat('seat_threshold', 0., minval=0.)
@@ -1181,6 +1190,17 @@ class DockAutotune:
         self._log({'tool': tool.tool_number, 'axis': axis or 'z', 'seat': row})
         return row
 
+    def _seat_reachable(self, sp, dx, dy):
+        """True if the lowest point of the lift, shifted by dx and dy, is inside of the range of the machine"""
+        try:
+            status = self.printer.lookup_object('toolhead').get_status(self._now())
+            low, high = status['axis_minimum'], status['axis_maximum']
+        except (KeyError, TypeError):
+            return True
+        point = sp['geo']['low']
+        x, y = sp['x'] + dx + point['x'], sp['y'] + dy + point['y']
+        return low[0] <= x <= high[0] and low[1] <= y <= high[1]
+
     def _seat_start_check(self, sp):
         status = self._tc_status()
         if status.get('detected_tool_number', -1) != -1:
@@ -1207,6 +1227,9 @@ class DockAutotune:
         number = tool.tool_number
         sp = self._seat_params(tool)
         self._seat_start_check(sp)
+        if not self._seat_reachable(sp, 0.0, 0.0):
+            raise AbortScan("T%d: the park position X=%.2f Y=%.2f is outside of the machine range" % (
+                number, sp['x'], sp['y']))
         top_z = sp['z'] + sp['geo']['top']['z']
         info = self.seat_info
         info.update({'park_z': sp['z'], 'verify_z': top_z, 'speed': self.seat_speed, 'coarse': None,
@@ -1250,6 +1273,12 @@ class DockAutotune:
                     if stopped[sign]:
                         continue
                     self._check_abort()
+                    dx, dy = (offset, 0.0) if axis == 'x' else (0.0, offset)
+                    if not self._seat_reachable(sp, dx, dy):
+                        stopped[sign] = True
+                        gcmd.respond_info("dock_autotune T%d: %s %+.2f mm is outside of the machine range, this side "
+                                          "ends here" % (number, axis.upper(), offset))
+                        continue
                     row = self._seat_position(tool, sp, axis, offset, repeats, slow_rel)
                     rows.append(row)
                     fails[sign] = 0 if row['ok'] else fails[sign] + 1
@@ -1260,7 +1289,8 @@ class DockAutotune:
                                             ["Quiet window %s: %s" % (axis.upper(), proposal['text'])]))
             if not axes:
                 self.seat_rows['z'] = [center]
-        except AbortScan:
+        except (AbortScan, self.gcode.error):
+            # the shuttle stands under the tool: take it out of the dock, also after an error of a move
             try:
                 self._seat_leave(sp)
             except self.gcode.error:
@@ -1339,6 +1369,14 @@ class DockAutotune:
             limits = {a: gcmd.get_float('RANGE', above=0.) for a in AXES}
         for a in AXES:
             limits[a] = gcmd.get_float('RANGE_%s' % a.upper(), limits[a], above=0.)
+        if mode == 'seat':
+            for a in axes:
+                if limits[a] > self.seat_range_limit + 1e-9:
+                    gcmd.respond_info("dock_autotune: %s +/-%.2f mm is more than seat_range_limit (%.2f mm): a tool can "
+                                      "fall out of its dock when the pins are far off. Using +/-%.2f mm. To look "
+                                      "further, move the park position and measure again"
+                                      % (a.upper(), limits[a], self.seat_range_limit, self.seat_range_limit))
+                    limits[a] = self.seat_range_limit
         repeats = gcmd.get_int('REPEATS', self.seat_repeats if mode == 'seat' else self.repeats, minval=1)
         speed = gcmd.get_float('SPEED', self.speed_factor, above=0., maxval=1.)
         dry_run = gcmd.get_int('DRY_RUN', 0) == 1

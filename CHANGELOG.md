@@ -2,6 +2,23 @@
 
 The project is a prototype; the entries explain what changed and why, newest first.
 
+## 2026-10-31 (late night): smaller range, safety, open windows
+
+A run with `RANGE_X=1.5 RANGE_Y=2.0` (recommended in the previous round) showed that this is too much: at X +1.5 mm the tool
+detection was off at the top, with four knocks, a sign that the pins caught the tool badly, and the Y scan went to Y
+-32.2 mm, outside of the machine range (-32.0), so the move failed and the shuttle stayed in the dock.
+
+* `seat_range` is 0.5 mm now; `RANGE=` cannot exceed `seat_range_limit` (1 mm, config), a larger value is reduced with a
+  message that says to move the park position and measure again.
+* A side ends at the first position where the tool detection is off (`seat_fail_stop`, was 2).
+* Positions outside of the machine range (`axis_minimum` / `axis_maximum`) are left out, that side ends there.
+* After an error of a move the shuttle is taken out of the dock before the run stops (it was only done for aborts).
+* A quiet window that is open on one side now gives a suggestion: the centre of the measured part, marked "open on the
+  minus/plus side", the real centre lies further that way. Before there was no value at all.
+* What the data said: with Y at -0.6 mm the X scan was flat (score 0.084 to 0.107) from -1.5 to +1.0 mm and loud only at
+  +1.5 mm (detection off). The loud band in X at Y 0 had come from Y 0 being the loud edge of the Y window: the two axes
+  depend on each other, so the second axis has to be measured with the first one in its quiet range.
+
 ## 2026-10-31 (night): wording of the console and the result files
 
 * The park positions are listed as **current** and **new** (the scan applies the new value until the next restart, the seat

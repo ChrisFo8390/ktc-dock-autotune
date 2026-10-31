@@ -153,8 +153,12 @@ shows where the knocks are. All later lifts go at that speed up to `seat_zone` (
 slowly through the contact (`seat_speed`, 2 mm/s) up to the `verify` waypoint. The knocks are found in the accelerometer
 signal after a high-pass (`adxl_window`) that removes gravity and the smooth acceleration of the moves, and are timed
 against the known move of the shuttle, so their height comes out in mm (about 0.01 mm). Positions: the park position,
-then `seat_step` (0.25 mm) steps along X and along Y up to `seat_range` (1 mm) to both sides, `seat_repeats` (3) lifts
-each. A side ends after `seat_fail_stop` positions in a row where the tool detection was off at the top.
+then `seat_step` (0.25 mm) steps along X and along Y up to `seat_range` (0.5 mm) to both sides, `seat_repeats` (3) lifts
+each. **Keep the range small:** a tool whose pins are far off is lifted unevenly and can fall out of its dock. `RANGE=`
+cannot go above `seat_range_limit` (1 mm); to look further, move the park position (`SET_TOOL_PARAMETER`) and measure
+again. A side ends at the first position where the tool detection was off at the top (`seat_fail_stop`) and at the
+limits of the machine (positions outside of the axis range are left out). If a move fails anyway, the shuttle is taken
+out of the dock before the run stops.
 
 **What the accelerometer sees.** The tools hang in their docks. If the position does not fit, the rounded pin tips lift
 the tool a little and it falls into the shuttle as soon as it has enough play: that is the knock (about 8 g on a
@@ -173,8 +177,9 @@ The result file has more columns (lateral share, net velocity change) for a look
   quarter between the lowest and the highest, looks for a run of them with a louder position on **both** sides, and
   suggests its centre as the new `params_park_x/y` together with a ready `SET_TOOL_PARAMETER` line. Nothing is applied:
   try the value, then run the seat test again around it and check that the position is quiet and the window is
-  centred. If the quiet range reaches the end of the measured range the window is *not closed* and no value is
-  suggested (raise `seat_range`); if all positions are alike the message says so.
+  centred. If the quiet range reaches the end of the measured range on one side, the centre of the measured part is
+  suggested and marked *open on that side*: the real centre lies further that way. If there is no louder position at
+  all, the message says so; if all positions are alike, it says that too.
 * **Z:** the strongest knock is where shuttle and tool touch or snap. The path continues up to the `verify` waypoint, so
   the distance between the two is how far the path goes on; the result file shows both.
 
