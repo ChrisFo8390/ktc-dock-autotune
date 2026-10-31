@@ -352,11 +352,13 @@ class FakeDock:
         self.fail_unselect = False
         self.skip_recovery = False
         self.accel = 12000.0
+        self.models = {}            # more tools in their docks: number -> (tool, truth, window)
 
-    def locks(self):
+    def locks(self, number=None):
+        tool, truth, window = self.models.get(number, (self.tool, self.truth, self.window))
         for axis in 'xyz':
-            rel = self.tool.params['params_park_' + axis] - self.truth[axis]
-            if not self.window[axis][0] - 1e-9 <= rel <= self.window[axis][1] + 1e-9:
+            rel = tool.params['params_park_' + axis] - truth[axis]
+            if not window[axis][0] - 1e-9 <= rel <= window[axis][1] + 1e-9:
                 return False
         return True
 
@@ -381,13 +383,14 @@ class FakeGcode:
         d = self.dock
         d.scripts.append(script)
         word = script.split()[0]
-        if word == 'SELECT_TOOL' and int(script.split('T=')[1].split()[0]) != d.tool.tool_number:
-            d.mounted = d.detected = int(script.split('T=')[1].split()[0])     # another tool: not part of the model
+        picked = int(script.split('T=')[1].split()[0]) if word == 'SELECT_TOOL' else None
+        if word == 'SELECT_TOOL' and picked != d.tool.tool_number and picked not in d.models:
+            d.mounted = d.detected = picked                                     # another tool: not part of the model
         elif word == 'SELECT_TOOL':
             assert "RESTORE_AXIS=''" in script
             d.pickups += 1
-            if d.locks():
-                d.status, d.mounted, d.detected = 'ready', d.tool.tool_number, d.tool.tool_number
+            if d.locks(picked):
+                d.status, d.mounted, d.detected = 'ready', picked, picked
             else:
                 d.status, d.mounted, d.detected = 'uninitialized', -1, -1
                 d.y = 100.0 if not d.skip_recovery else -20.0
@@ -411,7 +414,8 @@ class FakeToolchanger:
 
     def get_status(self, eventtime):
         d = self.dock
-        return {'status': d.status, 'tool_number': d.mounted, 'detected_tool_number': d.detected}
+        return {'status': d.status, 'tool_number': d.mounted, 'detected_tool_number': d.detected,
+                'tool_numbers': sorted(set(d.models) | {d.tool.tool_number})}
 
 
 class FakeToolhead:
@@ -894,6 +898,147 @@ class CommandTests(unittest.TestCase):
         self.assertIn('ADXL map', gcmd.text)
         self.assertIn('nothing moved', gcmd.text)
         self.assertEqual(self.dock.scripts, [])
+
+    # -- several tools in one run -------------------------------------------------------------
+
+    def add_tool(self, number, hidden=(0.1, 0.0, -0.1), window=WINDOW):
+        tool = FakeTool(number, 100.0 + number, -29.4, 266.2)
+        truth = {'x': tool.params['params_park_x'] + hidden[0], 'y': -29.4 + hidden[1], 'z': 266.2 + hidden[2]}
+        self.dock.models[number] = (tool, truth, window)
+        self.printer.objects['tool T%d' % number] = tool
+        return tool, truth
+
+    def test_parse_tool_list(self):
+        parse = dock_autotune.parse_tool_list
+        self.assertEqual(parse('0,2'), [0, 2])
+        self.assertEqual(parse(' 0-3 , 5'), [0, 1, 2, 3, 5])
+        self.assertEqual(parse('2,1,2'), [2, 1])
+        self.assertEqual(parse('ALL', [3, 1, 2]), [1, 2, 3])
+        for bad in ('', ',', 'x', '1-', '-1', 'a-b', 'all'):
+            with self.assertRaises(ValueError):
+                parse(bad)
+
+    def test_several_tools_one_after_the_other_in_one_file(self):
+        self.make()
+        t3, truth3 = self.add_tool(3)
+        gcmd = self.scan(TOOLS='2,3', AXES='z', RANGE=0.6, STEP=0.2)
+        self.assertNotIn('STOPPED', gcmd.text)
+        picks = [s.split('T=')[1].split()[0] for s in self.dock.scripts if s.startswith('SELECT_TOOL')]
+        self.assertEqual(picks[0], '2')
+        self.assertEqual(picks[-1], '3')
+        self.assertNotIn('2', picks[picks.index('3'):])
+        self.assertAlmostEqual(self.tool.params['params_park_z'], self.centre('z'), places=3)
+        self.assertAlmostEqual(t3.params['params_park_z'], truth3['z'] + sum(WINDOW['z']) / 2, places=3)
+        name, text = self.report()
+        self.assertRegex(name, r'^tools_scan_[0-9]{8}_[0-9]{6}[.]txt$')
+        self.assertIn('Dock autotune T2, T3 - scan', text)
+        self.assertIn('T2  finished', text)
+        self.assertIn('T3  finished', text)
+        self.assertIn('Put these lines into the tool files', text)
+        self.assertIn('  T3:\n    params_park_z:', text)
+        self.assertIn('Dock autotune T3 - scan', text)           # the full report of each tool follows
+        self.assertEqual(text.count('Scan trials Z'), 2)
+
+    def test_preparation_runs_once(self):
+        self.make()
+        self.add_tool(3)
+        self.carto()
+        self.printer.objects['toolhead'].homed = ''
+        self.dock.homed = False
+        self.scan(TOOLS='2,3', AXES='z', RANGE=0.3, PREPARE=1)
+        self.assertEqual(sum(1 for s in self.dock.scripts if s.startswith('M190')), 1)
+        self.assertEqual(self.dock.scripts.count('G28'), 1)
+        self.assertEqual(sum(1 for s in self.dock.scripts if s == 'CARTOGRAPHER_TOUCH_HOME'), 1)
+        self.assertEqual(self.dock.scripts.count('SET_VELOCITY_LIMIT ACCEL=2000'), 1)
+
+    def test_the_shuttle_goes_back_to_the_start_without_a_tool(self):
+        self.make()
+        self.add_tool(3)
+        self.scan(TOOLS='2,3', AXES='z', RANGE=0.3)
+        self.assertEqual(self.dock.scripts[-4:-1], ['G90', 'G0 X0.000 Y100.000 F6000', 'G0 Z0.000 F3000'])
+        self.assertTrue(self.dock.scripts[-1].startswith('SET_VELOCITY_LIMIT'))     # the acceleration is put back
+        self.assertEqual(self.dock.mounted, -1)
+        # one tool: where it ends is not touched
+        self.make()
+        self.scan(T=2, AXES='z', RANGE=0.3)
+        self.assertFalse(any(s.startswith('G0') for s in self.dock.scripts))
+
+    def test_not_homed_before_the_run_stays_at_safe_y(self):
+        self.make()
+        self.add_tool(3)
+        self.printer.objects['toolhead'].homed = ''
+        self.dock.homed = False
+        self.carto()
+        gcmd = self.scan(TOOLS='2,3', AXES='z', RANGE=0.3, PREPARE=1)
+        self.assertIn('was not homed before the run', gcmd.text)
+        self.assertFalse(any(s.startswith('G0') for s in self.dock.scripts))
+
+    def test_a_stopped_tool_ends_the_run(self):
+        # T3 sits 2 mm off, its baseline does not lock: T2 is not run, the shuttle does not move on its own
+        self.make()
+        self.add_tool(3, hidden=(0.0, 0.0, 2.0))
+        gcmd = self.scan(TOOLS='3,2', AXES='z', RANGE=0.3)
+        self.assertIn('T3 STOPPED', gcmd.text)
+        self.assertNotIn('T=2', ' '.join(s for s in self.dock.scripts if s.startswith('SELECT_TOOL')))
+        self.assertFalse(any(s.startswith('G0') for s in self.dock.scripts))
+        name, text = self.report()
+        self.assertIn('T3  STOPPED', text)
+        self.assertIn('T2  not run', text)
+
+    def test_interrupt_between_two_tools(self):
+        self.make()
+        self.add_tool(3)
+        real = self.module._scan_tool
+
+        def scan_then_interrupt(*a, **kw):
+            try:
+                return real(*a, **kw)
+            finally:
+                self.module.abort = True
+        self.module._scan_tool = scan_then_interrupt
+        self.scan(TOOLS='2,3', AXES='z', RANGE=0.3)
+        picks = [s for s in self.dock.scripts if s.startswith('SELECT_TOOL')]
+        self.assertTrue(picks)
+        self.assertFalse(any('T=3' in s for s in picks))
+        self.assertFalse(self.module.active)
+
+    def test_all_tools_from_the_toolchanger(self):
+        self.make()
+        self.add_tool(3)
+        gcmd = self.scan(TOOLS='all', AXES='z', RANGE=0.3, DRY_RUN=1)
+        self.assertIn('dock_autotune T2 scan', gcmd.text)
+        self.assertIn('dock_autotune T3 scan', gcmd.text)
+        self.assertIn('would be done one after the other', gcmd.text)
+        self.assertEqual(self.dock.scripts, [])
+
+    def test_tools_from_the_config(self):
+        self.make(tools='2,3')
+        self.add_tool(3)
+        gcmd = FakeGcmd(PREPARE=0, AXES='z', RANGE=0.3, DRY_RUN=1)
+        self.module.cmd_DOCK_AUTOTUNE(gcmd)
+        self.assertIn('T3 scan', gcmd.text)
+
+    def test_which_tools(self):
+        self.make()
+        for params in ({}, {'T': 2, 'TOOLS': '2,3'}, {'TOOLS': 'x'}, {'TOOLS': '2,9'}):
+            with self.assertRaises(CommandError):
+                self.scan(**params)
+
+    def test_prompt_for_several_tools(self):
+        self.make()
+        self.add_tool(3)
+        self.carto()
+        gcmd = FakeGcmd(TOOLS='2,3', AXES='z')
+        self.module.cmd_DOCK_AUTOTUNE(gcmd)
+        text = '\n'.join(self.printer.objects['gcode'].raw)
+        self.assertIn('prompt_begin Dock autotune T2, T3', text)
+        self.assertIn('DOCK_AUTOTUNE TOOLS=2,3 AXES=z PREPARE=1', text)
+
+    def report(self):
+        files = sorted(os.listdir(self.module.results_dir))
+        self.assertEqual(len(files), 1)
+        with open(os.path.join(self.module.results_dir, files[0])) as f:
+            return files[0], f.read()
 
     # -- config defaults and the result file --------------------------------------------------
 

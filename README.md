@@ -81,6 +81,20 @@ DOCK_AUTOTUNE T=1                       # x, y and z with the configured ranges
 DOCK_AUTOTUNE_INTERRUPT                 # stops after the current trial (M112 stops at once)
 ```
 
+**Several tools in one run.** `TOOLS=0,1,2`, `TOOLS=0-4` or `TOOLS=all` (every tool of the toolchanger; or `tools:` in
+`dock_autotune.cfg`) instead of `T=`:
+
+```
+DOCK_AUTOTUNE TOOLS=all PREPARE=1
+```
+
+The preparation runs once. Then the tools follow one after the other, each one starts from safe Y, and the park
+positions of a tool are kept for the following ones. When all are done and the machine was homed at the start, the
+shuttle goes back without a tool to X, Y and Z where the toolhead stood before. The result is one file,
+`tools_<mode>_<time>.txt` in the results folder: how each tool ended, the park positions of all tools with the lines
+for the tool files, and the full report of each tool below. If a tool stops (error, `DOCK_AUTOTUNE_INTERRUPT`) the run
+ends there, the remaining tools are listed as "not run", and the shuttle stays where it is.
+
 What the command does without further parameters is set in `dock_autotune.cfg`: `mode` (scan, map or seat), `axes`,
 `prepare` (ask, yes, no), `adxl`, `adxl_raw`, the ranges and so on. With `mode: map`, `axes: z` and `prepare: no`
 the ADXL map of the Z axis is `DOCK_AUTOTUNE T=0`. A parameter of the call always wins.
@@ -111,7 +125,7 @@ it is how the edge is found. A scan takes at most `2 * range / step` trials per 
 
 | Parameter | |
 |---|---|
-| `T=<n>` | tool, required |
+| `T=<n>` / `TOOLS=0,1,2` | one tool / several tools (`0-4`, `all`), one of them is required |
 | `AXES=xyz` | axes to tune, default all |
 | `STEP`, `RESOLUTION`, `RANGE`, `RANGE_X/Y/Z` | override the config (mm) |
 | `REPEATS`, `SPEED` | pickups per candidate, factor on `params_path_speed` while scanning |

@@ -50,17 +50,18 @@ class MacroTests(unittest.TestCase):
     def test_parameters_without_a_field_are_forwarded_too(self):
         self.assertEqual(render({'T': '2', 'RANGE_Z': '0.3'}), ['DOCK_AUTOTUNE_RUN T=2 RANGE_Z=0.3'])
 
-    def test_tool_is_required(self):
-        for params in ({}, {'AXES': 'z'}, {'T': ''}):
-            with self.assertRaises(MacroError) as ctx:
-                render(params)
-            self.assertIn('T=N (the tool number)', str(ctx.exception))
+    def test_the_tool_is_checked_by_the_module(self):
+        # T=n, TOOLS=... or the tools of the config: the module knows, the macro just forwards
+        self.assertEqual(render({'TOOLS': '0,1'}), ['DOCK_AUTOTUNE_RUN TOOLS=0,1'])
+        self.assertEqual(len(render({})), 1)
 
     def test_console_texts_have_no_html_tags(self):
         # the console of Mainsail shows text as HTML: <s> strikes everything through, <n> disappears
         macro = read_macro()
         self.assertNotRegex(macro['description'], r'<[A-Za-z/]')
-        self.assertNotRegex(macro['gcode'].split('action_raise_error')[1].split(chr(10))[0], r'<[A-Za-z/]')
+        for line in macro['gcode'].split(chr(10)):
+            if 'action_' in line or 'RESPOND' in line:
+                self.assertNotRegex(line, r'<[A-Za-z/]')
 
     def test_every_field_of_the_ui_is_a_parameter_of_the_macro(self):
         # Mainsail makes an input field of every params.<NAME> in the macro

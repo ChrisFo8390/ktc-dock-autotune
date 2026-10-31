@@ -312,6 +312,71 @@ def build_report(info):
     return '\n'.join(lines) + '\n'
 
 
+def parse_tool_list(text, known=None):
+    """'0,2', '0-4' or 'all' (every number in `known`) -> tool numbers in the order given, without repeats"""
+    text = text.strip().lower()
+    if text == 'all':
+        if not known:
+            raise ValueError("TOOLS=all: the toolchanger does not know its tools")
+        return sorted(known)
+    numbers = []
+    for item in text.replace(' ', '').split(','):
+        if not item:
+            continue
+        try:
+            if '-' in item:
+                low, high = (int(v) for v in item.split('-', 1))
+                if high < low:
+                    raise ValueError(item)
+                values = range(low, high + 1)
+            else:
+                values = [int(item)]
+        except ValueError:
+            raise ValueError("cannot read '%s' in TOOLS (use 0,1,2 or 0-4 or all)" % item)
+        for value in values:
+            if value not in numbers:
+                numbers.append(value)
+    if not numbers:
+        raise ValueError("TOOLS is empty (use 0,1,2 or 0-4 or all)")
+    return numbers
+
+
+def build_multi_report(runs, numbers, mode, when):
+    """The result file of a run over several tools: how each tool ended, the park positions of all of them (and
+    the lines for the tool files), then the full report of every tool. runs: number, status, info (or None)"""
+    names = {'map': 'ADXL map', 'seat': 'seat test'}
+    lines = ["Dock autotune %s - %s - %s" % (', '.join('T%d' % n for n in numbers), names.get(mode, 'scan'), when),
+             "Tools:"]
+    done = {r['number']: r for r in runs}
+    for n in numbers:
+        lines.append("  T%-2d %s" % (n, done[n]['status'] if n in done else 'not run'))
+    lines.extend(["", "Park positions" + (" (applied until the next restart)" if mode == 'scan' else ""),
+                  "  tool  axis      before       after   result"])
+    changed = {}
+    for r in runs:
+        info = r.get('info')
+        if not info:
+            lines.append("  T%-3d no result (%s)" % (r['number'], r['status']))
+            continue
+        for axis in AXES:
+            after, text = _park_result(axis, info)
+            lines.append("  T%-3d %-4s %10.3f  %10.3f   %s" % (r['number'], axis, info['originals'][axis], after, text))
+            if after != info['originals'][axis]:
+                changed.setdefault(r['number'], []).append("params_park_%s: %.3f" % (axis, after))
+    lines.append("")
+    if changed:
+        lines.append("Put these lines into the tool files (toolchanger/tools/T0.cfg, T1.cfg, ...):")
+        for n in sorted(changed):
+            lines.append("  T%d:" % n)
+            lines.extend("    " + c for c in changed[n])
+    else:
+        lines.append("No park position was changed.")
+    for r in runs:
+        if r.get('info'):
+            lines.extend(["", "=" * 78, ""] + build_report(r['info']).rstrip('\n').splitlines())
+    return '\n'.join(lines) + '\n'
+
+
 # ---------------------------------------------------------------------------
 # Seat test: the vertical lift into the shuttle, the tool stays in its dock (pure, used by the tests)
 # ---------------------------------------------------------------------------
@@ -611,7 +676,7 @@ def build_prompt(number, params, setup, plan, bed, touch_cmd):
     def line(text):
         return '// action:' + text.replace('\n', ' ')
 
-    out = [line('prompt_begin Dock autotune T%d' % number)]
+    out = [line('prompt_begin Dock autotune %s' % (number if isinstance(number, str) else 'T%d' % number))]
     close = line('prompt_footer_button Close|RESPOND TYPE=command MSG=action:prompt_end|info')
     if not setup['can_prepare']:
         out.append(line('prompt_text Preparation is not possible: %s.' % setup['reason']))
@@ -707,6 +772,7 @@ class DockAutotune:
         if self.mode not in ('scan', 'map', 'seat'):
             raise config.error("dock_autotune: mode must be scan, map or seat")
         self.axes = ''.join(a for a in config.get('axes', AXES).lower() if a in AXES) or AXES
+        self.tools_default = config.get('tools', '').strip()
         self.adxl_default = config.getboolean('adxl', False)
         self.raw_default = config.getboolean('adxl_raw', False)
         prepare = config.get('prepare', 'ask').strip().lower()
@@ -1266,10 +1332,28 @@ class DockAutotune:
                               "[RESOLUTION=0.05] [SPEED=0.5] [ADXL=1] [MODE=scan|map|seat] [RAW=1] [PREPARE=0|1] "
                               "[BED=70] [SOAK=SECONDS] [TOUCH=0] [DRY_RUN=1]")
 
+    def _tool_numbers(self, gcmd):
+        """The tools of the call: T=n, or TOOLS=0,1,2 / 0-4 / all (or `tools` of the config)"""
+        text, single = gcmd.get('TOOLS', None), gcmd.get('T', None)
+        if text is not None and single is not None:
+            raise gcmd.error("DOCK_AUTOTUNE: use T=n for one tool or TOOLS=0,1,2 for several, not both")
+        if text is None and single is not None:
+            return [gcmd.get_int('T', minval=0)]
+        text = text if text is not None else self.tools_default
+        if not text.strip():
+            raise gcmd.error("DOCK_AUTOTUNE: T=n (one tool) or TOOLS=0,1,2 / 0-4 / all is required, for example "
+                             "DOCK_AUTOTUNE T=1 DRY_RUN=1")
+        try:
+            return parse_tool_list(text, self._tc_status().get('tool_numbers'))
+        except ValueError as e:
+            raise gcmd.error("DOCK_AUTOTUNE: %s" % e)
+
     def cmd_DOCK_AUTOTUNE(self, gcmd):
         if self.active:
             raise gcmd.error("DOCK_AUTOTUNE is already running (DOCK_AUTOTUNE_INTERRUPT stops it)")
-        number = gcmd.get_int('T', minval=0)
+        numbers = self._tool_numbers(gcmd)
+        multi = len(numbers) > 1
+        label = numbers[0] if not multi else ', '.join('T%d' % n for n in numbers)
         axes = ''.join(a for a in gcmd.get('AXES', self.axes).lower() if a in AXES)
         mode = gcmd.get('MODE', self.mode).strip().lower()
         if mode not in ('scan', 'map', 'seat'):
@@ -1293,16 +1377,19 @@ class DockAutotune:
         speed = gcmd.get_float('SPEED', self.speed_factor, above=0., maxval=1.)
         raw = gcmd.get_int('RAW', 1 if self.raw_default else 0) == 1
         self.use_adxl = gcmd.get_int('ADXL', 1 if self.adxl_default else 0) == 1 or mode in ('map', 'seat')
-        if self.use_adxl and self.printer.lookup_object(self.accel_chip.format(tool=number), None) is None:
-            if mode in ('map', 'seat'):
-                raise gcmd.error("DOCK_AUTOTUNE: MODE=%s needs the accelerometer [%s]"
-                                 % (mode, self.accel_chip.format(tool=number)))
-            gcmd.respond_info("dock_autotune: ADXL=1 but there is no [%s] section - scanning without the "
-                              "accelerometer" % self.accel_chip.format(tool=number))
         dry_run = gcmd.get_int('DRY_RUN', 0) == 1
-        tool = self.printer.lookup_object('tool T%d' % number, None)
-        if tool is None:
-            raise gcmd.error("DOCK_AUTOTUNE: no tool T%d" % number)
+        tools = []
+        for number in numbers:
+            tool = self.printer.lookup_object('tool T%d' % number, None)
+            if tool is None:
+                raise gcmd.error("DOCK_AUTOTUNE: no tool T%d" % number)
+            chip = self.accel_chip.format(tool=number)
+            if self.use_adxl and self.printer.lookup_object(chip, None) is None:
+                if mode in ('map', 'seat'):
+                    raise gcmd.error("DOCK_AUTOTUNE: MODE=%s needs the accelerometer [%s]" % (mode, chip))
+                gcmd.respond_info("dock_autotune: ADXL=1 but there is no [%s] section - scanning without the "
+                                  "accelerometer" % chip)
+            tools.append(tool)
         self._check_not_printing(gcmd)
 
         # PREPARE=1: bring the machine into the state of a print start first, PREPARE=0: it is
@@ -1318,7 +1405,7 @@ class DockAutotune:
                                  % (bed, setup['max_bed']))
             touch, plan = self._make_plan(gcmd, setup, bed, soak)
             if prepare is None and not dry_run:
-                self._prompt(gcmd, number, setup, plan, bed, touch)
+                self._prompt(gcmd, label, setup, plan, bed, touch)
                 return
             if prepare == 1 and not setup['can_prepare']:
                 raise gcmd.error("DOCK_AUTOTUNE: preparation is not possible: %s. Prepare the machine by hand "
@@ -1332,43 +1419,46 @@ class DockAutotune:
                                      setup['level_cmd'] or 'none'))
         prepare = prepare == 1
         if not prepare and not (dry_run and plan):
-            self._check_state(gcmd, number)
+            self._check_state(gcmd, numbers[0])
 
         per_axis = {a: int(limits[a] / step + 1e-9) for a in axes}
         bisect = max(0, int(math.ceil(math.log(step / resolution, 2) - 1e-9))) if self.refine else 0
-        if mode == 'seat':
-            positions = 1 + sum(2 * n for n in per_axis.values())
-            gcmd.respond_info("dock_autotune T%d seat test, axes %s, step %.3f mm, range %s, %d repeat(s): up to "
-                              "%d lifts at %d positions, the tool stays in its dock; current dock position "
-                              "x=%.3f y=%.3f z=%.3f"
-                              % (number, axes.upper() or '-', step, ' '.join('%s+/-%.2f' % (a, limits[a]) for a in axes),
-                                 repeats, 1 + positions * repeats, positions,
-                                 *[float(tool.params['params_park_%s' % a]) for a in 'xyz']))
-        else:
-            if mode == 'map':
-                trials = sum(2 * n + 1 for n in per_axis.values())
+        for number, tool in zip(numbers, tools):
+            if mode == 'seat':
+                positions = 1 + sum(2 * n for n in per_axis.values())
+                gcmd.respond_info("dock_autotune T%d seat test, axes %s, step %.3f mm, range %s, %d repeat(s): up to "
+                                  "%d lifts at %d positions, the tool stays in its dock; current dock position "
+                                  "x=%.3f y=%.3f z=%.3f"
+                                  % (number, axes.upper() or '-', step,
+                                     ' '.join('%s+/-%.2f' % (a, limits[a]) for a in axes),
+                                     repeats, 1 + positions * repeats, positions,
+                                     *[float(tool.params['params_park_%s' % a]) for a in 'xyz']))
             else:
-                trials = sum(2 * n + 2 * bisect + 2 for n in per_axis.values())
-            gcmd.respond_info("dock_autotune T%d %s, axes %s, step %.3f mm, range %s, %d repeat(s): about %d trials "
-                              "(%d pickups) at most, current dock position x=%.3f y=%.3f z=%.3f"
-                              % (number, 'ADXL map' if mode == 'map' else 'scan', axes.upper(), step,
-                                 ' '.join('%s+/-%.2f' % (a, limits[a]) for a in axes),
-                                 repeats, trials, trials * repeats,
-                                 *[float(tool.params['params_park_%s' % a]) for a in 'xyz']))
+                if mode == 'map':
+                    trials = sum(2 * n + 1 for n in per_axis.values())
+                else:
+                    trials = sum(2 * n + 2 * bisect + 2 for n in per_axis.values())
+                gcmd.respond_info("dock_autotune T%d %s, axes %s, step %.3f mm, range %s, %d repeat(s): about %d "
+                                  "trials (%d pickups) at most, current dock position x=%.3f y=%.3f z=%.3f"
+                                  % (number, 'ADXL map' if mode == 'map' else 'scan', axes.upper(), step,
+                                     ' '.join('%s+/-%.2f' % (a, limits[a]) for a in axes),
+                                     repeats, trials, trials * repeats,
+                                     *[float(tool.params['params_park_%s' % a]) for a in 'xyz']))
         if dry_run:
             if plan:
                 gcmd.respond_info("DRY_RUN: PREPARE=1 would run first:\n  " + '\n  '.join(
                     p for p in plan if p != EMPTY_SHUTTLE))
             if mode == 'seat':
                 try:
-                    sp = self._seat_params(tool, speed)
+                    sp = self._seat_params(tools[0], speed)
                 except AbortScan as e:
                     raise gcmd.error("DOCK_AUTOTUNE: %s" % e)
                 enter, leave = self._seat_plan(sp)
                 low, top = sp['geo']['low'], sp['geo']['top']
                 gcmd.respond_info(
-                    "DRY_RUN: the empty shuttle moves like this (G-code, like the pickup_gcode up to the verify "
-                    "waypoint):\n  " + '\n  '.join(enter) +
+                    "DRY_RUN: the empty shuttle moves like this%s (G-code, like the pickup_gcode up to the verify "
+                    "waypoint):\n  " % (" for T%d, the other tools with their own park positions" % numbers[0]
+                                         if multi else "") + '\n  '.join(enter) +
                     "\nat every position (X or Y shifted at the lowest point), the accelerometer on:\n"
                     "  G0 Z%.4f F%g   lift to the verify waypoint (the first lift; the later ones go at this speed up to "
                     "%g mm below the first knock, then at %g mm/s)\n"
@@ -1376,31 +1466,78 @@ class DockAutotune:
                     "and at the end:\n  " % (sp['z'] + top['z'], sp['path_speed'] * top['f'], self.seat_zone,
                                              self.seat_speed, sp['z'] + low['z'], sp['path_speed']) +
                     '\n  '.join(leave))
+            if multi:
+                gcmd.respond_info("DRY_RUN: the tools %s would be done one after the other (each one starts at safe "
+                                  "Y); then the shuttle goes back to where the toolhead stood, and one result file "
+                                  "holds the park positions of all tools" % label)
             gcmd.respond_info("DRY_RUN: nothing moved")
             return
         self.repeats, saved_repeats = repeats, self.repeats
-        self._start(number)
+        self._start(numbers[0])
         toolhead = self.printer.lookup_object('toolhead')
         saved_accel = toolhead.get_status(self._now())['max_accel']
-        saved_speed = float(tool.params['params_path_speed'])
-        originals = {a: float(tool.params['params_park_%s' % a]) for a in AXES}
-        proposals, base = {}, {}
-        status = 'stopped'
-        settings = ['step %.3f mm' % step, 'range ' + ' '.join('%s+/-%.2f' % (a, limits[a]) for a in axes),
-                    '%d repeat(s)' % repeats, 'speed factor %g' % speed,
-                    'acceleration %g' % min(self.accel, saved_accel)]
-        if mode in ('map', 'seat'):
-            settings.append('high-pass %d ms' % int(round(self.adxl_window * 1000)))
-        if mode == 'seat':
-            settings.append('speed at the contact %g mm/s' % self.seat_speed)
-        settings.append('machine prepared by DOCK_AUTOTUNE with bed %g C' % bed if prepare
-                        else 'machine was prepared before')
+        start_position = self._start_position() if multi else None
+        runs = []
         try:
             if prepare:
                 self._prepare(gcmd, plan)
-                self._check_state(gcmd, number)
             self.state['phase'] = 'start'
             self._run("SET_VELOCITY_LIMIT ACCEL=%g" % min(self.accel, saved_accel))
+            for index, (number, tool) in enumerate(zip(numbers, tools)):
+                self._check_abort()
+                settings = ['step %.3f mm' % step, 'range ' + ' '.join('%s+/-%.2f' % (a, limits[a]) for a in axes),
+                            '%d repeat(s)' % repeats, 'speed factor %g' % speed,
+                            'acceleration %g' % min(self.accel, saved_accel)]
+                if mode in ('map', 'seat'):
+                    settings.append('high-pass %d ms' % int(round(self.adxl_window * 1000)))
+                if mode == 'seat':
+                    settings.append('speed at the contact %g mm/s' % self.seat_speed)
+                settings.append('machine prepared by DOCK_AUTOTUNE with bed %g C' % bed if prepare
+                                else 'machine was prepared before')
+                run = self._run_tool(gcmd, tool, mode, axes, limits, step, repeats, resolution, raw, speed, settings,
+                                     check=prepare or index > 0, runs=runs, save=not multi)
+                if run['status'] != 'finished':
+                    break
+            if multi and len(runs) == len(numbers) and all(r['status'] == 'finished' for r in runs):
+                self.result = {'tools': {r['number']: r['result'] for r in runs}}
+                self._return_to_start(gcmd, start_position, tools[-1])
+        except AbortScan as e:
+            self._abort_report(gcmd, self.state['tool'] if self.state['tool'] is not None else label, e)
+        except self.gcode.error as e:
+            self._abort_report(gcmd, self.state['tool'] if self.state['tool'] is not None else label, e)
+            raise
+        finally:
+            if multi and runs:
+                path = self._save_report('tools_%s_%s.txt' % (mode, time.strftime('%Y%m%d_%H%M%S')),
+                                         lambda: build_multi_report(runs, numbers, mode,
+                                                                    time.strftime('%Y-%m-%d %H:%M:%S')))
+                if path:
+                    gcmd.respond_info("dock_autotune: result file %s" % path)
+            try:
+                self._run("SET_VELOCITY_LIMIT ACCEL=%g" % saved_accel)
+            except self.gcode.error:
+                logging.exception("dock_autotune: could not restore the acceleration")
+            self.repeats = saved_repeats
+            self.active = False
+            self.state['phase'] = 'idle'
+
+    def _run_tool(self, gcmd, tool, mode, axes, limits, step, repeats, resolution, raw, speed, settings, check,
+                  runs, save):
+        """The measurement of one tool (scan, map or seat test) with the park values and the path speed put back
+        afterwards. Appends its run (number, status, info, result) to `runs`; an AbortScan ends this tool only."""
+        number = tool.tool_number
+        interrupted = self.abort        # an interrupt between two tools is not forgotten
+        self._start(number)
+        self.abort = interrupted
+        saved_speed = float(tool.params['params_path_speed'])
+        originals = {a: float(tool.params['params_park_%s' % a]) for a in AXES}
+        proposals = {}
+        status = 'stopped'
+        run = {'number': number, 'status': status, 'info': None, 'result': {}}
+        runs.append(run)
+        try:
+            if check:
+                self._check_state(gcmd, number)
             tool.set_parameter('params_path_speed', saved_speed * speed)
             if self._tc_status()['tool_number'] == number:
                 self._run("UNSELECT_TOOL %s" % RESTORE_NONE)
@@ -1411,31 +1548,32 @@ class DockAutotune:
                 gcmd.respond_info("dock_autotune T%d ADXL map finished after %d pickups, the park values are "
                                   "unchanged%s" % (number, self.cycles,
                                                    ", CSV snippets in %s" % self.raw_dir if raw else ""))
-                status = 'finished'
             elif mode == 'seat':
                 self._seat_tool(gcmd, tool, axes, limits, step, repeats)
                 self.result = {'tool': number, 'seat': self.seat_rows}
                 gcmd.respond_info("dock_autotune T%d seat test finished after %d lifts, the park values are "
                                   "unchanged" % (number, self.cycles))
-                status = 'finished'
             else:
                 base, result = self._scan_tool(gcmd, tool, axes, limits, step, resolution)
                 proposals = {a: base[a] for a in axes if result[a]['proposal'] is not None}
                 self.result = {'tool': number, 'axes': result}
                 self._finish_ok(gcmd, number, originals, proposals, result)
-                status = 'finished'
+            status = 'finished'
         except AbortScan as e:
             status = 'STOPPED: %s' % e
             self._abort_report(gcmd, number, e)
         except self.gcode.error as e:
             status = 'STOPPED: %s' % e
-            self._abort_report(gcmd, number, e)
             raise
         finally:
-            path = self._write_report(number, mode, status, originals, proposals, settings,
-                                      self.raw_dir if raw and mode_map else None)
-            if path:
-                gcmd.respond_info("dock_autotune: result file %s" % path)
+            info = self._report_info(number, mode, status, originals, proposals, settings,
+                                     self.raw_dir if raw and mode == 'map' else None)
+            run.update(status=status, info=info, result=self.result)
+            if save and info:
+                path = self._save_report('T%d_%s_%s.txt' % (number, mode, time.strftime('%Y%m%d_%H%M%S')),
+                                         lambda: build_report(info))
+                if path:
+                    gcmd.respond_info("dock_autotune: result file %s" % path)
             # back to the old values except for the axes that were centred
             for a in AXES:
                 if a in proposals:
@@ -1443,32 +1581,54 @@ class DockAutotune:
                 else:
                     tool.set_parameter('params_park_%s' % a, originals[a])
             tool.set_parameter('params_path_speed', saved_speed)
-            try:
-                self._run("SET_VELOCITY_LIMIT ACCEL=%g" % saved_accel)
-            except self.gcode.error:
-                logging.exception("dock_autotune: could not restore the acceleration")
-            self.repeats = saved_repeats
-            self.active = False
-            self.state['phase'] = 'idle'
+        return run
 
-    def _write_report(self, number, mode, status, originals, proposals, settings, raw_dir):
-        """Writes the result file (park positions, ADXL measurements, CSV) to results_dir, returns its path"""
+    def _report_info(self, number, mode, status, originals, proposals, settings, raw_dir):
+        """What the result file of one tool is made of, None if nothing was measured"""
         seat = self.seat_info if (self.seat_rows or self.seat_info.get('coarse')) else None
-        if not self.results_dir or not (self.trial_rows or any(self.map_rows.values()) or seat):
+        if not (self.trial_rows or any(self.map_rows.values()) or seat):
             return None
-        info = {'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'tool': number, 'mode': mode, 'status': status,
+        return {'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'tool': number, 'mode': mode, 'status': status,
                 'pickups': self.cycles, 'settings': settings, 'originals': originals, 'new': proposals,
                 'scan': self.scan_result, 'trials': self.trial_rows, 'map': self.map_rows, 'seat': seat,
                 'window': self.adxl_window, 'raw_dir': raw_dir}
-        path = os.path.join(self.results_dir, 'T%d_%s_%s.txt' % (number, mode, time.strftime('%Y%m%d_%H%M%S')))
+
+    def _save_report(self, name, render):
+        """Writes the text that render() makes to results_dir, returns the path (None: no folder or not writable)"""
+        if not self.results_dir:
+            return None
+        path = os.path.join(self.results_dir, name)
         try:
+            text = render()
             os.makedirs(self.results_dir, exist_ok=True)
             with open(path, 'w') as f:
-                f.write(build_report(info))
+                f.write(text)
         except (OSError, KeyError, TypeError, ValueError):
             logging.exception("dock_autotune: cannot write the result file %s", path)
             return None
         return path
+
+    def _start_position(self):
+        """Where the toolhead stands, None if the machine is not homed"""
+        status = self.printer.lookup_object('toolhead').get_status(self._now())
+        if all(a in status['homed_axes'] for a in 'xyz'):
+            return list(status['position'][:3])
+        return None
+
+    def _return_to_start(self, gcmd, position, tool):
+        """Without a tool on the shuttle back to where the toolhead stood before the run: sideways at the height of
+        the docks first, then down (not nearer to the docks than close Y)"""
+        if position is None:
+            gcmd.respond_info("dock_autotune: the machine was not homed before the run, the shuttle stays at safe Y")
+            return
+        close_y = float(tool.params.get('params_close_y', 0.0))
+        fast = float(tool.params.get('params_fast_speed', 6000.0))
+        self._run('G90')
+        self._run('G0 X%.3f Y%.3f F%g' % (position[0], max(position[1], close_y), fast))
+        self._run('G0 Z%.3f F%g' % (position[2], 3000.0))
+        self.printer.lookup_object('toolhead').wait_moves()
+        gcmd.respond_info("dock_autotune: all tools done, the shuttle is back at X=%.1f Y=%.1f Z=%.1f"
+                          % (position[0], max(position[1], close_y), position[2]))
 
     def _check_not_printing(self, gcmd):
         stats = self.printer.lookup_object('print_stats', None)
@@ -1521,9 +1681,10 @@ class DockAutotune:
 
     def _abort_report(self, gcmd, number, error):
         status = self._tc_status()
-        gcmd.respond_info("dock_autotune T%d STOPPED: %s. Toolchanger: %s, tool %s. The park values are back at "
+        gcmd.respond_info("dock_autotune %s STOPPED: %s. Toolchanger: %s, tool %s. The park values are back at "
                           "their old values. Check the shuttle and the dock before you do anything else."
-                          % (number, error, status['status'], status['tool_number']))
+                          % (number if isinstance(number, str) else 'T%d' % number, error, status['status'],
+                             status['tool_number']))
         self._log({'tool': number, 'aborted': str(error)})
 
     def cmd_INTERRUPT(self, gcmd):
