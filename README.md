@@ -15,7 +15,7 @@ Tallboi with Cartographer, five tools). Read "Safety" before the first run.
 * **seat** (default). The empty shuttle drives under the tool, lifts into it up to the `verify` waypoint, reads the tool
   detection and goes down again. The tool never leaves its dock. The accelerometer of the tool records the contact, so
   the result file shows **at which height** shuttle and tool touch and **how the tool is pushed sideways** while the
-  pins find their holes, for the current park position and for positions along X and Y. Nothing is changed.
+  pins find their holes, for the current park position and for positions along X and Y, and suggests a better one.
 * **scan**. Looks for the window of positions in which the tool locks and puts `params_park_x/y/z` in the middle of it.
   It does full pickups and dropoffs and uses only the tool detection pin. Rounded pins find their way in over a wide
   range, so on such a shuttle the window can be wider than any range you dare to scan: the axis is then left alone and
