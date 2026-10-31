@@ -8,8 +8,14 @@ one printer (Voron with Cartographer, five tools). Read "Safety" before the firs
 
 ## How it works
 
-A tool locks into the shuttle only inside a window of positions. `DOCK_AUTOTUNE` looks for that window per axis
-and puts `params_park_x/y/z` of the tool in the middle of it:
+`DOCK_AUTOTUNE` has three modes (`MODE=` or `mode:` in `dock_autotune.cfg`; the default is **seat**):
+
+* **seat** (default): the shuttle lifts into the tool and down again without taking it out of its dock, and the
+  accelerometer measures the height of the contact and the sideways push (see "Seat test"). Changes nothing.
+* **scan**: finds the window of positions in which a tool locks and centres the dock position (below).
+* **map**: the ADXL map of full pickups (see "ADXL map"). Changes nothing.
+
+The scan looks for the window per axis and puts `params_park_x/y/z` of the tool in the middle of it:
 
 1. A *trial* is a pickup (`SELECT_TOOL`, the tool detection at the `verify` waypoint must see the tool) and a
    dropoff (`UNSELECT_TOOL`), `repeats` times. All of them have to lock.
@@ -75,10 +81,11 @@ Mainsail updates the module only; the installer also refreshes the macro file.)
 ## Use
 
 ```
-DOCK_AUTOTUNE T=1 DRY_RUN=1             # detection and plan, nothing moves
-DOCK_AUTOTUNE T=1 AXES=z RANGE=0.4      # first run: one axis, small range, watch it
-DOCK_AUTOTUNE T=1                       # x, y and z with the configured ranges
-DOCK_AUTOTUNE_INTERRUPT                 # stops after the current trial (M112 stops at once)
+DOCK_AUTOTUNE T=1 DRY_RUN=1                      # detection and plan, nothing moves
+DOCK_AUTOTUNE T=1                                # seat test (the default mode): measures, changes nothing
+DOCK_AUTOTUNE T=1 MODE=scan AXES=z RANGE=0.4     # scan, first run: one axis, small range, watch it
+DOCK_AUTOTUNE T=1 MODE=scan                      # scan of x, y and z with the configured ranges
+DOCK_AUTOTUNE_INTERRUPT                          # stops after the current trial (M112 stops at once)
 ```
 
 **Several tools in one run.** `TOOLS=0,1,2`, `TOOLS=0-4` or `TOOLS=all` (every tool of the toolchanger; or `tools:` in
@@ -103,7 +110,7 @@ the ADXL map of the Z axis is `DOCK_AUTOTUNE T=0`. A parameter of the call alway
 
 **Preparation.** Docks have to be tuned in the state they are used in: bed temperature, levelled gantry, and with a
 touch homing the Z zero taken by the touch tool. Without `PREPARE` the command shows a prompt with the detected probe
-and the steps; **Prepare and start** runs them (bed temperature 70 °C by default, change it with the buttons or
+and the steps (both buttons close it); **Prepare and start** (blue) runs them (bed temperature 70 °C by default, change it with the buttons or
 `BED=`), **The machine is already prepared** skips them. The steps follow a `PRINT_START`:
 
 1. `INITIALIZE_TOOLCHANGER`, a tool on the shuttle goes back into its dock

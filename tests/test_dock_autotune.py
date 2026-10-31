@@ -298,7 +298,7 @@ class PromptTests(unittest.TestCase):
         self.assertTrue(text.startswith('// action:prompt_begin Dock autotune T1'))
         self.assertTrue(text.rstrip().endswith('// action:prompt_show'))
         self.assertIn('Cartographer', text)
-        self.assertIn('Prepare and start (bed 70 C)|DOCK_AUTOTUNE T=1 AXES=z PREPARE=1 BED=70|primary', text)
+        self.assertIn('Prepare and start (bed 70 C)|DOCK_AUTOTUNE T=1 AXES=z PREPARE=1 BED=70|info', text)
         self.assertIn('+5 C|DOCK_AUTOTUNE T=1 AXES=z BED=75|', text)
         self.assertIn('-10 C|DOCK_AUTOTUNE T=1 AXES=z BED=60|', text)
         self.assertIn('already prepared|DOCK_AUTOTUNE T=1 AXES=z PREPARE=0|', text)
@@ -604,6 +604,7 @@ class CommandTests(unittest.TestCase):
 
     def scan(self, **params):
         params.setdefault('PREPARE', 0)         # the prompt is tested separately
+        params.setdefault('MODE', 'scan' if self.module.mode == 'seat' else self.module.mode)    # seat is the default
         gcmd = FakeGcmd(**params)
         self.module.cmd_DOCK_AUTOTUNE(gcmd)
         return gcmd
@@ -1014,7 +1015,7 @@ class CommandTests(unittest.TestCase):
     def test_tools_from_the_config(self):
         self.make(tools='2,3')
         self.add_tool(3)
-        gcmd = FakeGcmd(PREPARE=0, AXES='z', RANGE=0.3, DRY_RUN=1)
+        gcmd = FakeGcmd(PREPARE=0, AXES='z', RANGE=0.3, DRY_RUN=1, MODE='scan')
         self.module.cmd_DOCK_AUTOTUNE(gcmd)
         self.assertIn('T3 scan', gcmd.text)
 
@@ -1028,17 +1029,47 @@ class CommandTests(unittest.TestCase):
         self.make()
         self.add_tool(3)
         self.carto()
-        gcmd = FakeGcmd(TOOLS='2,3', AXES='z')
+        gcmd = FakeGcmd(TOOLS='2,3', AXES='z', MODE='scan')
         self.module.cmd_DOCK_AUTOTUNE(gcmd)
         text = '\n'.join(self.printer.objects['gcode'].raw)
         self.assertIn('prompt_begin Dock autotune T2, T3', text)
-        self.assertIn('DOCK_AUTOTUNE TOOLS=2,3 AXES=z PREPARE=1', text)
+        self.assertIn('DOCK_AUTOTUNE TOOLS=2,3 AXES=z MODE=scan PREPARE=1', text)
 
     def report(self):
         files = sorted(os.listdir(self.module.results_dir))
         self.assertEqual(len(files), 1)
         with open(os.path.join(self.module.results_dir, files[0])) as f:
             return files[0], f.read()
+
+    # -- prompt and default mode ---------------------------------------------------------------
+
+    def test_the_default_mode_is_the_seat_test(self):
+        self.make()
+        self.assertEqual(self.module.mode, 'seat')
+        with self.assertRaises(CommandError) as ctx:           # without a mode the seat test needs its accelerometer
+            self.module.cmd_DOCK_AUTOTUNE(FakeGcmd(T=2, PREPARE=0))
+        self.assertIn('MODE=seat needs the accelerometer', str(ctx.exception))
+
+    def test_buttons_of_the_prompt_have_colours_and_the_call_closes_the_prompt(self):
+        self.make()
+        self.carto()
+        self.module.cmd_DOCK_AUTOTUNE(FakeGcmd(T=2, AXES='z', MODE='scan'))
+        raw = self.printer.objects['gcode'].raw
+        self.assertEqual(len([r for r in raw if '|info' in r and 'prompt_button ' in r]), 1)       # the blue one
+        self.assertTrue(any('The machine is already prepared' in r and r.endswith('|warning') for r in raw))
+        self.assertNotIn('// action:prompt_end', raw)               # the prompt is open, nothing is closed yet
+        # a button calls the command again with PREPARE: the prompt goes away, then the run starts
+        for prepare in (0, 1):
+            self.make()
+            self.carto()
+            self.scan(T=2, AXES='z', RANGE=0.3, PREPARE=prepare)
+            self.assertEqual(self.printer.objects['gcode'].raw[0], '// action:prompt_end')
+
+    def test_dry_run_leaves_a_prompt_alone(self):
+        self.make()
+        self.carto()
+        self.scan(T=2, AXES='z', PREPARE=0, DRY_RUN=1)
+        self.assertEqual(self.printer.objects['gcode'].raw, [])
 
     # -- config defaults and the result file --------------------------------------------------
 
@@ -1157,7 +1188,7 @@ class CommandTests(unittest.TestCase):
     def test_without_prepare_the_prompt_is_shown_and_nothing_moves(self):
         self.make()
         self.carto()
-        self.module.cmd_DOCK_AUTOTUNE(FakeGcmd(T=2, AXES='z'))
+        self.module.cmd_DOCK_AUTOTUNE(FakeGcmd(T=2, AXES='z', MODE='scan'))
         raw = self.printer.objects['gcode'].raw
         self.assertEqual(raw[0], '// action:prompt_begin Dock autotune T2')
         self.assertEqual(raw[-1], '// action:prompt_show')
@@ -1242,7 +1273,7 @@ class CommandTests(unittest.TestCase):
                 raise CommandError('Probing failed')
             return real(script)
         self.printer.objects['gcode'].run_script_from_command = run
-        gcmd = FakeGcmd(T=2, PREPARE=1)
+        gcmd = FakeGcmd(T=2, PREPARE=1, MODE='scan')
         with self.assertRaises(CommandError):
             self.module.cmd_DOCK_AUTOTUNE(gcmd)
         self.assertEqual(self.dock.pickups, 0)
@@ -1260,7 +1291,7 @@ class CommandTests(unittest.TestCase):
     def test_prompt_without_a_way_to_home_offers_only_continue(self):
         self.make()
         self.carto({'stepper_z': {'endstop_pin': 'tool_probe_endstop:z'}, 'tool_probe t0': {}})
-        self.module.cmd_DOCK_AUTOTUNE(FakeGcmd(T=2))
+        self.module.cmd_DOCK_AUTOTUNE(FakeGcmd(T=2, MODE='scan'))
         text = '\n'.join(self.printer.objects['gcode'].raw)
         self.assertIn('Preparation is not possible', text)
         self.assertNotIn('PREPARE=1', text)
@@ -1295,7 +1326,7 @@ class CommandTests(unittest.TestCase):
         self.make()
         self.carto()
         self.printer.objects['toolhead'].homed = ''
-        gcmd = FakeGcmd(T=2, DRY_RUN=1)
+        gcmd = FakeGcmd(T=2, DRY_RUN=1, MODE='scan')
         self.module.cmd_DOCK_AUTOTUNE(gcmd)
         self.assertIn('M190 S70', gcmd.text)
         self.assertIn('Cartographer', gcmd.text)

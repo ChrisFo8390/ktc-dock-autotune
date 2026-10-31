@@ -701,11 +701,11 @@ def build_prompt(number, params, setup, plan, bed, touch_cmd):
         if new != bed:
             out.append(line('prompt_button %+d C|%s|secondary' % (delta, command_line(params, BED='%g' % new))))
     out.append(line('prompt_button_group_end'))
-    out.append(line('prompt_button Prepare and start (bed %g C)|%s|primary'
+    out.append(line('prompt_button Prepare and start (bed %g C)|%s|info'
                     % (bed, command_line(params, PREPARE=1, BED='%g' % bed))))
     out.append(line('prompt_button The machine is already prepared|%s|warning'
                     % command_line(params, PREPARE=0, BED=None)))
-    out.extend([line('prompt_footer_button Cancel|RESPOND TYPE=command MSG=action:prompt_end|info'),
+    out.extend([line('prompt_footer_button Cancel|RESPOND TYPE=command MSG=action:prompt_end|secondary'),
                 line('prompt_show')])
     return out
 
@@ -768,7 +768,7 @@ class DockAutotune:
         self.seat_repeats = config.getint('seat_repeats', 3, minval=1)
         self.seat_threshold = config.getfloat('seat_threshold', 0., minval=0.)
         # defaults of the command line: DOCK_AUTOTUNE T=0 alone does what these say
-        self.mode = config.get('mode', 'scan').strip().lower()
+        self.mode = config.get('mode', 'seat').strip().lower()
         if self.mode not in ('scan', 'map', 'seat'):
             raise config.error("dock_autotune: mode must be scan, map or seat")
         self.axes = ''.join(a for a in config.get('axes', AXES).lower() if a in AXES) or AXES
@@ -1395,6 +1395,8 @@ class DockAutotune:
         # PREPARE=1: bring the machine into the state of a print start first, PREPARE=0: it is
         # prepared already, without PREPARE the prompt asks (not for DRY_RUN)
         prepare = gcmd.get_int('PREPARE', self.prepare_default)
+        if prepare is not None and not dry_run:
+            self.gcode.respond_raw("// action:prompt_end")      # the buttons of the prompt call this with PREPARE
         bed = gcmd.get_float('BED', self.bed_temp, minval=0.)
         soak = gcmd.get_float('SOAK', self.bed_soak, minval=0.)
         plan = []
