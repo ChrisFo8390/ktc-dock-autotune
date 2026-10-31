@@ -82,13 +82,17 @@ to the config directory by hand.
 
 `DOCK_AUTOTUNE` is a command that the module registers. Mainsail, Fluidd and the touch UIs list only
 `[gcode_macro]` sections, so the command works in the console but is not in the macro list, and a UI cannot offer
-it. `dock_autotune_macro.cfg` fixes that: it defines `[gcode_macro DOCK_AUTOTUNE]` with `rename_existing: DOCK_AUTOTUNE_BASE`,
-takes the name and forwards all parameters to the module. Mainsail shows an input field for every parameter
-(`T`, `AXES`, `RANGE`, `STEP`, `REPEATS`, `SPEED`, `BED`, `SOAK`, `PREPARE`, `TOUCH`, `ADXL`, `DRY_RUN`). `T` is required.
-The prompt buttons and all examples below work unchanged. `DOCK_AUTOTUNE_INTERRUPT` stays a module command, it is
-meant to be typed or put on a button. An existing installation gets the new file with `git pull && ./install.sh`.
-Without the module the macro stops Klipper at start (`Existing command 'DOCK_AUTOTUNE' not found`), so keep both
-include lines together.
+it. `dock_autotune_macro.cfg` fixes that: it defines `[gcode_macro DOCK_AUTOTUNE]` and calls the command of the module,
+`DOCK_AUTOTUNE_RUN`, with all parameters. The module notices the macro and then does not register the name
+`DOCK_AUTOTUNE` itself. Mainsail shows an input field for every parameter (`T`, `AXES`, `RANGE`, `STEP`, `REPEATS`,
+`SPEED`, `BED`, `SOAK`, `PREPARE`, `TOUCH`, `ADXL`, `DRY_RUN`). `T` is required.
+
+* The macro must not use `rename_existing`: Mainsail leaves macros that have it out of its list.
+* The prompt buttons and all examples below work unchanged. Without the macro file the module registers
+  `DOCK_AUTOTUNE` itself, and `DOCK_AUTOTUNE_RUN` always works.
+* `DOCK_AUTOTUNE_INTERRUPT` stays a module command, it is meant to be typed or put on a button.
+* `install.sh` copies the macro file and updates it with every run (`dock_autotune.cfg`, which holds your settings,
+  is never overwritten). Module and macro file belong together: update both with `git pull && ./install.sh`.
 
 ## Use
 

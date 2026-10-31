@@ -14,6 +14,9 @@
 # homing, gantry levelling, touch homing with T0 for Cartographer / Beacon contact). The module
 # detects the probe and offers that preparation in a prompt (Mainsail / Fluidd), see DOCK_AUTOTUNE.
 #
+# Commands: DOCK_AUTOTUNE_RUN (always) and DOCK_AUTOTUNE (the same, unless a macro of that name is
+# configured, see config/dock_autotune_macro.cfg), DOCK_AUTOTUNE_INTERRUPT.
+#
 # Optionally the accelerometer of the tool is recorded during every trial (peak and RMS of
 # the shock, written to the log). It only helps to judge a position and to stop a scan when
 # something hits hard (abort_g); it never decides on its own.
@@ -280,11 +283,23 @@ class DockAutotune:
         self.state = {'tool': None, 'axis': None, 'phase': 'idle', 'trial': 0, 'message': ''}
         self.result = {}
         self.cycles = 0
-        self.gcode.register_command('DOCK_AUTOTUNE', self.cmd_DOCK_AUTOTUNE,
+        # DOCK_AUTOTUNE_RUN always is the command of the module. DOCK_AUTOTUNE is it too, unless the config has
+        # a [gcode_macro DOCK_AUTOTUNE] (dock_autotune_macro.cfg): Mainsail lists only macros, so that macro
+        # carries the name and calls DOCK_AUTOTUNE_RUN
+        self.gcode.register_command('DOCK_AUTOTUNE_RUN', self.cmd_DOCK_AUTOTUNE,
                                     desc=self.cmd_DOCK_AUTOTUNE_help)
+        if not self._has_macro(config, 'DOCK_AUTOTUNE'):
+            self.gcode.register_command('DOCK_AUTOTUNE', self.cmd_DOCK_AUTOTUNE,
+                                        desc=self.cmd_DOCK_AUTOTUNE_help)
         # 'INTERRUPT' in the name: Klipper runs it without waiting for the running scan
         self.gcode.register_command('DOCK_AUTOTUNE_INTERRUPT', self.cmd_INTERRUPT,
                                     desc="Stop a running DOCK_AUTOTUNE after the current trial")
+
+    @staticmethod
+    def _has_macro(config, name):
+        prefix = 'gcode_macro '
+        return any(section.get_name()[len(prefix):].strip().upper() == name
+                   for section in config.get_prefix_sections(prefix))
 
     def get_status(self, eventtime=None):
         return {'active': self.active, 'tool': self.state['tool'], 'axis': self.state['axis'],

@@ -376,6 +376,15 @@ class FakeConfig:
     def get_printer(self):
         return self.printer
 
+    def get_prefix_sections(self, prefix):
+        class Section:
+            def __init__(self, name):
+                self.name = name
+
+            def get_name(self):
+                return self.name
+        return [Section(n) for n in self.options.get('sections', ()) if n.startswith(prefix)]
+
     def _get(self, name, default, cast):
         return cast(self.options.get(name, default))
 
@@ -450,8 +459,20 @@ class CommandTests(unittest.TestCase):
         self.make()
         commands = self.printer.objects['gcode'].commands
         self.assertIn('DOCK_AUTOTUNE', commands)
+        self.assertIn('DOCK_AUTOTUNE_RUN', commands)
         # 'INTERRUPT' in the name makes Klipper run it while the scan is running
         self.assertIn('DOCK_AUTOTUNE_INTERRUPT', commands)
+
+    def test_a_macro_of_that_name_gets_the_name_and_calls_the_run_command(self):
+        self.make(sections=['gcode_macro dock_autotune'])
+        commands = self.printer.objects['gcode'].commands
+        self.assertNotIn('DOCK_AUTOTUNE', commands)
+        self.assertIn('DOCK_AUTOTUNE_RUN', commands)
+        self.assertIn('DOCK_AUTOTUNE_INTERRUPT', commands)
+
+    def test_other_macros_do_not_take_the_name(self):
+        self.make(sections=['gcode_macro DOCK_TUNER', 'gcode_macro DOCK_AUTOTUNE_START'])
+        self.assertIn('DOCK_AUTOTUNE', self.printer.objects['gcode'].commands)
 
     def test_scan_centres_the_window(self):
         self.make()

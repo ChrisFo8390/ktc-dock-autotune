@@ -130,9 +130,16 @@ function install_config {
     fi
     local name
     for name in ${CONFIG_FILES}; do
-        if [ ! -e "${CONFIG_PATH}/${name}" ]; then
+        # The macro file has no settings: it is updated with the module (dock_autotune.cfg holds yours)
+        if [ "${name}" = "dock_autotune_macro.cfg" ] && [ -e "${CONFIG_PATH}/${name}" ]                 && ! cmp -s "${INSTALL_PATH}/config/${name}" "${CONFIG_PATH}/${name}"; then
+            backup_file "${CONFIG_PATH}/${name}"
+            cp "${INSTALL_PATH}/config/${name}" "${CONFIG_PATH}/${name}"
+            echo "[INSTALL] Updated ${CONFIG_PATH}/${name}"
+        elif [ ! -e "${CONFIG_PATH}/${name}" ]; then
             cp "${INSTALL_PATH}/config/${name}" "${CONFIG_PATH}/${name}"
             echo "[INSTALL] Installed ${CONFIG_PATH}/${name}"
+        elif [ "${name}" = "dock_autotune_macro.cfg" ]; then
+            echo "[INFO] ${CONFIG_PATH}/${name} is up to date"
         else
             echo "[INFO] ${CONFIG_PATH}/${name} exists and is not overwritten"
             echo "[INFO] Compare it with ${INSTALL_PATH}/config/${name} for new settings"

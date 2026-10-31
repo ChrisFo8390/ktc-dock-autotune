@@ -37,17 +37,18 @@ def render(params):
 
 @unittest.skipIf(jinja2 is None, 'jinja2 is not installed')
 class MacroTests(unittest.TestCase):
-    def test_takes_the_name_of_the_module_command_and_renames_it(self):
+    def test_has_no_rename_existing(self):
+        # Mainsail leaves macros with rename_existing out of its macro list - the reason for this macro
         macro = read_macro()
-        self.assertEqual(macro['rename_existing'], 'DOCK_AUTOTUNE_BASE')
+        self.assertNotIn('rename_existing', macro)
         self.assertTrue(macro['description'])
 
     def test_forwards_all_parameters(self):
         self.assertEqual(render({'T': '1', 'AXES': 'z', 'RANGE': '0.4', 'BED': '75', 'PREPARE': '1'}),
-                         ['DOCK_AUTOTUNE_BASE T=1 AXES=z RANGE=0.4 BED=75 PREPARE=1'])
+                         ['DOCK_AUTOTUNE_RUN T=1 AXES=z RANGE=0.4 BED=75 PREPARE=1'])
 
     def test_parameters_without_a_field_are_forwarded_too(self):
-        self.assertEqual(render({'T': '2', 'RANGE_Z': '0.3'}), ['DOCK_AUTOTUNE_BASE T=2 RANGE_Z=0.3'])
+        self.assertEqual(render({'T': '2', 'RANGE_Z': '0.3'}), ['DOCK_AUTOTUNE_RUN T=2 RANGE_Z=0.3'])
 
     def test_tool_is_required(self):
         for params in ({}, {'AXES': 'z'}, {'T': ''}):
